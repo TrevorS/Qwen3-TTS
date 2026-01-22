@@ -456,3 +456,215 @@ mod real_weights_tests {
         assert_eq!(speaker["sample_rate"], 24000);
     }
 }
+
+/// Tests for speech tokenizer using real downloaded weights
+mod speech_tokenizer_tests {
+    use std::path::Path;
+
+    /// Path to downloaded speech tokenizer data
+    const SPEECH_TOKENIZER_DIR: &str = "test_data/speech_tokenizer";
+
+    fn speech_tokenizer_available() -> bool {
+        Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors").exists()
+    }
+
+    #[test]
+    fn test_speech_tokenizer_config_parsing() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_config_parsing: test data not found");
+            eprintln!("Run: ./scripts/download_test_data.sh to download");
+            return;
+        }
+
+        // Read and parse the config
+        let config_path = Path::new(SPEECH_TOKENIZER_DIR).join("config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify architecture
+        assert_eq!(config["model_type"], "qwen3_tts_tokenizer_12hz");
+        assert!(config["encoder_config"].is_object());
+        assert!(config["decoder_config"].is_object());
+
+        // Check encoder config
+        let encoder = &config["encoder_config"];
+        assert_eq!(encoder["sampling_rate"], 24000);
+        assert_eq!(encoder["num_quantizers"], 32);
+        assert_eq!(encoder["codebook_size"], 2048);
+        assert_eq!(encoder["hidden_size"], 512);
+
+        // Check decoder config
+        let decoder = &config["decoder_config"];
+        assert_eq!(decoder["num_quantizers"], 16);
+        assert_eq!(decoder["codebook_size"], 2048);
+        assert_eq!(decoder["hidden_size"], 512);
+        assert_eq!(decoder["num_attention_heads"], 16);
+    }
+
+    #[test]
+    fn test_speech_tokenizer_model_loading() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_model_loading: test data not found");
+            return;
+        }
+
+        use safetensors::SafeTensors;
+
+        // Load the safetensors file
+        let model_path = Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors");
+        let model_bytes = std::fs::read(&model_path).unwrap();
+        let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
+
+        // Check that we have tensors
+        let tensor_names = tensors.names();
+        assert!(!tensor_names.is_empty());
+
+        // Should have encoder and decoder weights
+        let has_encoder = tensor_names.iter().any(|n| n.contains("encoder"));
+        let has_decoder = tensor_names.iter().any(|n| n.contains("decoder"));
+        assert!(has_encoder, "Model should have encoder weights");
+        assert!(has_decoder, "Model should have decoder weights");
+
+        // Count total tensors
+        println!("Speech tokenizer has {} tensors", tensor_names.len());
+    }
+
+    #[test]
+    fn test_speech_tokenizer_encoder_weights() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_encoder_weights: test data not found");
+            return;
+        }
+
+        use safetensors::SafeTensors;
+
+        let model_path = Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors");
+        let model_bytes = std::fs::read(&model_path).unwrap();
+        let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
+
+        // Find encoder embedding weights
+        let encoder_tensors: Vec<&String> = tensors.names()
+            .iter()
+            .filter(|n| n.starts_with("encoder."))
+            .cloned()
+            .collect();
+
+        assert!(!encoder_tensors.is_empty(), "Should have encoder tensors");
+        println!("Found {} encoder tensors", encoder_tensors.len());
+
+        // Check a specific tensor shape
+        for name in encoder_tensors.iter().take(5) {
+            let tensor = tensors.tensor(name).unwrap();
+            println!("  {}: {:?}", name, tensor.shape());
+        }
+    }
+
+    #[test]
+    fn test_speech_tokenizer_decoder_weights() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_decoder_weights: test data not found");
+            return;
+        }
+
+        use safetensors::SafeTensors;
+
+        let model_path = Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors");
+        let model_bytes = std::fs::read(&model_path).unwrap();
+        let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
+
+        // Find decoder weights
+        let decoder_tensors: Vec<&String> = tensors.names()
+            .iter()
+            .filter(|n| n.starts_with("decoder."))
+            .cloned()
+            .collect();
+
+        assert!(!decoder_tensors.is_empty(), "Should have decoder tensors");
+        println!("Found {} decoder tensors", decoder_tensors.len());
+
+        // Check a specific tensor shape
+        for name in decoder_tensors.iter().take(5) {
+            let tensor = tensors.tensor(name).unwrap();
+            println!("  {}: {:?}", name, tensor.shape());
+        }
+    }
+
+    #[test]
+    fn test_speech_tokenizer_quantizer_codebooks() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_quantizer_codebooks: test data not found");
+            return;
+        }
+
+        use safetensors::SafeTensors;
+
+        let model_path = Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors");
+        let model_bytes = std::fs::read(&model_path).unwrap();
+        let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
+
+        // Find quantizer/codebook weights
+        let all_names = tensors.names();
+        let codebook_tensors: Vec<&String> = all_names
+            .iter()
+            .filter(|n| n.contains("quantiz") || n.contains("codebook") || n.contains("embed"))
+            .cloned()
+            .collect();
+
+        println!("Found {} quantizer/codebook tensors:", codebook_tensors.len());
+        for name in &codebook_tensors {
+            let tensor = tensors.tensor(name).unwrap();
+            println!("  {}: {:?}", name, tensor.shape());
+        }
+
+        // Should have quantization-related weights
+        assert!(!codebook_tensors.is_empty(), "Should have quantizer weights");
+    }
+
+    #[test]
+    fn test_speech_tokenizer_preprocessor_config() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_speech_tokenizer_preprocessor_config: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(SPEECH_TOKENIZER_DIR).join("preprocessor_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify preprocessor config
+        assert_eq!(config["sampling_rate"], 24000);
+        assert_eq!(config["feature_size"], 1); // mono audio
+        assert_eq!(config["padding_side"], "right");
+    }
+
+    #[test]
+    fn test_load_tensor_to_candle() {
+        if !speech_tokenizer_available() {
+            eprintln!("Skipping test_load_tensor_to_candle: test data not found");
+            return;
+        }
+
+        use candle_core::Device;
+
+        let model_path = Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors");
+        let device = Device::Cpu;
+
+        // Use candle's built-in safetensors loading
+        let tensors = candle_core::safetensors::load(&model_path, &device).unwrap();
+
+        println!("Loaded {} tensors from safetensors file", tensors.len());
+
+        // Check a few tensors
+        for (name, tensor) in tensors.iter().take(5) {
+            println!("  {}: {:?} ({:?})", name, tensor.dims(), tensor.dtype());
+        }
+
+        // Verify we can access tensors
+        assert!(!tensors.is_empty(), "Should have loaded tensors");
+
+        // Verify tensor shapes are valid
+        for (name, tensor) in &tensors {
+            assert!(!tensor.dims().is_empty(), "Tensor {} should have valid shape", name);
+        }
+    }
+}
