@@ -274,3 +274,164 @@ impl Default for AudioCodecConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qwen3_tts_config_default() {
+        let config = Qwen3TTSConfig::default();
+        assert_eq!(config.model_type, "qwen3_tts");
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.hidden_size, 896);
+        assert_eq!(config.intermediate_size, 4864);
+        assert_eq!(config.num_hidden_layers, 24);
+        assert_eq!(config.num_attention_heads, 14);
+        assert!(config.num_key_value_heads.is_none());
+        assert_eq!(config.max_position_embeddings, 32768);
+        assert!((config.rope_theta - 1000000.0).abs() < 1e-6);
+        assert!((config.rms_norm_eps - 1e-6).abs() < 1e-12);
+        assert!(config.sliding_window.is_none());
+        assert_eq!(config.num_codebook_groups, 16);
+        assert_eq!(config.codebook_size, 2048);
+        assert_eq!(config.speaker_embed_dim, 1024);
+        assert!(!config.use_flash_attention);
+    }
+
+    #[test]
+    fn test_num_kv_heads_default() {
+        let config = Qwen3TTSConfig::default();
+        // When num_key_value_heads is None, should return num_attention_heads
+        assert_eq!(config.num_kv_heads(), 14);
+    }
+
+    #[test]
+    fn test_num_kv_heads_explicit() {
+        let mut config = Qwen3TTSConfig::default();
+        config.num_key_value_heads = Some(7);
+        assert_eq!(config.num_kv_heads(), 7);
+    }
+
+    #[test]
+    fn test_head_dim() {
+        let config = Qwen3TTSConfig::default();
+        // hidden_size=896, num_attention_heads=14 => head_dim=64
+        assert_eq!(config.head_dim(), 64);
+    }
+
+    #[test]
+    fn test_head_dim_custom() {
+        let mut config = Qwen3TTSConfig::default();
+        config.hidden_size = 1024;
+        config.num_attention_heads = 16;
+        assert_eq!(config.head_dim(), 64);
+    }
+
+    #[test]
+    fn test_audio_codec_config_default() {
+        let config = AudioCodecConfig::default();
+        assert_eq!(config.codec_type, "12hz");
+        assert_eq!(config.sample_rate, 24000);
+        assert_eq!(config.num_quantizers, 16);
+        assert_eq!(config.codebook_size, 2048);
+        assert!((config.frame_rate - 12.5).abs() < 1e-6);
+        assert_eq!(config.decoder_hidden_size, 1024);
+        assert_eq!(config.decoder_num_layers, 8);
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = Qwen3TTSConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: Qwen3TTSConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model_type, config.model_type);
+        assert_eq!(parsed.vocab_size, config.vocab_size);
+        assert_eq!(parsed.hidden_size, config.hidden_size);
+    }
+
+    #[test]
+    fn test_config_deserialization_with_defaults() {
+        // Deserialize minimal JSON - should use defaults
+        let json = r#"{"model_type": "test_model"}"#;
+        let config: Qwen3TTSConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_type, "test_model");
+        // Other fields should be defaults
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.hidden_size, 896);
+    }
+
+    #[test]
+    fn test_config_deserialization_custom_values() {
+        let json = r#"{
+            "model_type": "custom",
+            "vocab_size": 50000,
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4
+        }"#;
+        let config: Qwen3TTSConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model_type, "custom");
+        assert_eq!(config.vocab_size, 50000);
+        assert_eq!(config.hidden_size, 512);
+        assert_eq!(config.num_attention_heads, 8);
+        assert_eq!(config.num_key_value_heads, Some(4));
+    }
+
+    #[test]
+    fn test_audio_codec_config_serialization() {
+        let config = AudioCodecConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AudioCodecConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.codec_type, config.codec_type);
+        assert_eq!(parsed.sample_rate, config.sample_rate);
+    }
+
+    #[test]
+    fn test_talker_config() {
+        let talker = TalkerConfig {
+            hidden_size: 512,
+            intermediate_size: 2048,
+            num_hidden_layers: 12,
+            num_attention_heads: 8,
+            num_key_value_heads: Some(4),
+            vocab_size: 30000,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            sliding_window: Some(4096),
+        };
+        let json = serde_json::to_string(&talker).unwrap();
+        let parsed: TalkerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.hidden_size, 512);
+        assert_eq!(parsed.num_hidden_layers, 12);
+        assert_eq!(parsed.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn test_from_pretrained_nonexistent() {
+        let result = Qwen3TTSConfig::from_pretrained("/nonexistent/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        let result = Qwen3TTSConfig::from_file("/nonexistent/config.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = Qwen3TTSConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.model_type, config.model_type);
+        assert_eq!(cloned.vocab_size, config.vocab_size);
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = Qwen3TTSConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("qwen3_tts"));
+        assert!(debug_str.contains("896"));
+    }
+}

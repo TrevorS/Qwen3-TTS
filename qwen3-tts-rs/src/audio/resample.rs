@@ -166,6 +166,21 @@ pub fn resample_to_24k(audio: &AudioBuffer) -> Result<AudioBuffer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
+
+    #[test]
+    fn test_resample_quality_default() {
+        let resampler = Resampler::default();
+        // Should use Normal quality
+        assert!(matches!(resampler.quality, ResampleQuality::Normal));
+    }
+
+    #[test]
+    fn test_resample_quality_variants() {
+        let _fast = Resampler::new(ResampleQuality::Fast);
+        let _normal = Resampler::new(ResampleQuality::Normal);
+        let _high = Resampler::new(ResampleQuality::High);
+    }
 
     #[test]
     fn test_no_resample_needed() {
@@ -193,5 +208,59 @@ mod tests {
         assert_eq!(result.sample_rate, 24000);
         // Should be approximately 1.5x the samples
         assert!(result.len() > 2000 && result.len() < 3000);
+    }
+
+    #[test]
+    fn test_resample_to_24k() {
+        let audio = AudioBuffer::new(vec![0.0; 1600], 16000);
+        let result = resample_to_24k(&audio).unwrap();
+        assert_eq!(result.sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_resample_fast_quality() {
+        let resampler = Resampler::new(ResampleQuality::Fast);
+        let audio = AudioBuffer::new(vec![0.0; 2048], 48000);
+        let result = resampler.resample(&audio, 24000).unwrap();
+        assert_eq!(result.sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_resample_high_quality() {
+        let resampler = Resampler::new(ResampleQuality::High);
+        let audio = AudioBuffer::new(vec![0.0; 2048], 48000);
+        let result = resampler.resample(&audio, 24000).unwrap();
+        assert_eq!(result.sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_resample_preserves_sine_wave() {
+        // Create a low frequency sine wave that should survive resampling
+        let freq = 100.0; // 100 Hz - well below Nyquist for both sample rates
+        let audio = AudioBuffer::new(
+            (0..4800).map(|i| (2.0 * PI * freq * i as f32 / 48000.0).sin()).collect(),
+            48000,
+        );
+
+        let result = resample(&audio, 24000).unwrap();
+
+        // Check that output has non-zero values
+        let max_val = result.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(max_val > 0.5); // Sine wave should maintain amplitude
+    }
+
+    #[test]
+    fn test_resample_empty_audio() {
+        let audio = AudioBuffer::new(vec![], 24000);
+        let result = resample(&audio, 48000).unwrap();
+        // Should handle empty gracefully
+        assert_eq!(result.sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_resample_small_audio() {
+        let audio = AudioBuffer::new(vec![0.5, -0.5], 24000);
+        let result = resample(&audio, 48000).unwrap();
+        assert_eq!(result.sample_rate, 48000);
     }
 }

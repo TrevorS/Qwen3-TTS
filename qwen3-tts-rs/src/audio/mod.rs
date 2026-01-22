@@ -8,11 +8,11 @@
 
 mod io;
 mod mel;
-mod resample;
+pub mod resample;
 
 pub use io::{AudioBuffer, load_wav, save_wav};
 pub use mel::{MelSpectrogram, MelConfig};
-pub use resample::Resampler;
+pub use resample::{Resampler, resample, resample_to_24k};
 
 /// Standard sample rate used by Qwen3-TTS
 pub const SAMPLE_RATE: u32 = 24000;

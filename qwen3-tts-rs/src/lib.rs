@@ -163,3 +163,74 @@ pub fn auto_device() -> Result<Device> {
     tracing::info!("Using CPU device");
     Ok(Device::Cpu)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_synthesis_options_default() {
+        let options = SynthesisOptions::default();
+        assert_eq!(options.max_length, 2048);
+        assert!((options.temperature - 0.7).abs() < 1e-6);
+        assert_eq!(options.top_k, 50);
+        assert!((options.top_p - 0.9).abs() < 1e-6);
+        assert!((options.repetition_penalty - 1.0).abs() < 1e-6);
+        assert!(options.speaker_embedding.is_none());
+        assert!(options.language.is_none());
+    }
+
+    #[test]
+    fn test_synthesis_options_custom() {
+        let options = SynthesisOptions {
+            max_length: 512,
+            temperature: 0.5,
+            top_k: 10,
+            top_p: 0.8,
+            repetition_penalty: 1.2,
+            speaker_embedding: None,
+            language: Some("en".to_string()),
+        };
+        assert_eq!(options.max_length, 512);
+        assert!((options.temperature - 0.5).abs() < 1e-6);
+        assert_eq!(options.language, Some("en".to_string()));
+    }
+
+    #[test]
+    fn test_synthesis_options_clone() {
+        let options = SynthesisOptions::default();
+        let cloned = options.clone();
+        assert_eq!(cloned.max_length, options.max_length);
+        assert_eq!(cloned.top_k, options.top_k);
+    }
+
+    #[test]
+    fn test_synthesis_options_debug() {
+        let options = SynthesisOptions::default();
+        let debug_str = format!("{:?}", options);
+        assert!(debug_str.contains("max_length"));
+        assert!(debug_str.contains("2048"));
+    }
+
+    #[test]
+    fn test_auto_device() {
+        // Should always succeed on CPU
+        let device = auto_device().unwrap();
+        // Just verify it returns a valid device
+        assert!(matches!(device, Device::Cpu) || matches!(device, Device::Cuda(_)) || matches!(device, Device::Metal(_)));
+    }
+
+    #[test]
+    fn test_audio_buffer_reexport() {
+        // Verify re-exports work
+        let buffer = AudioBuffer::new(vec![0.0f32; 100], 24000);
+        assert_eq!(buffer.sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_config_reexport() {
+        // Verify config re-export works
+        let config = Qwen3TTSConfig::default();
+        assert_eq!(config.model_type, "qwen3_tts");
+    }
+}

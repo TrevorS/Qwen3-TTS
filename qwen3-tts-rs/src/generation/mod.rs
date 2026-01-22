@@ -7,4 +7,4 @@
 
 mod sampling;
 
-pub use sampling::{sample, GenerationConfig};
+pub use sampling::{sample, greedy_sample, apply_repetition_penalty, GenerationConfig};

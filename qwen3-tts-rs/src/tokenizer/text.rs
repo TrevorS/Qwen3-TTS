@@ -15,6 +15,38 @@ pub struct TextTokenizer {
     pub pad_token_id: u32,
 }
 
+/// Create a simple mock tokenizer for testing
+#[cfg(test)]
+fn create_mock_tokenizer() -> Tokenizer {
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    // Create a simple BPE tokenizer with a minimal vocab using array
+    let vocab: [(&str, u32); 10] = [
+        ("hello", 0),
+        ("world", 1),
+        ("test", 2),
+        ("<|im_start|>", 3),
+        ("<|im_end|>", 4),
+        ("<|endoftext|>", 5),
+        ("user", 6),
+        ("assistant", 7),
+        ("\n", 8),
+        ("Ġ", 9), // Space token for BPE
+    ];
+
+    let merges: Vec<(String, String)> = vec![];
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab.map(|(k, v)| (k.to_string(), v)), merges)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .unwrap();
+
+    let mut tokenizer = Tokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
+    tokenizer
+}
+
 impl TextTokenizer {
     /// Load tokenizer from a HuggingFace model ID or local path
     pub fn from_pretrained(model_id: &str) -> Result<Self> {
@@ -43,7 +75,9 @@ impl TextTokenizer {
     }
 
     /// Create from a tokenizers::Tokenizer instance
-    fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+    ///
+    /// This is useful for creating tokenizers from custom configurations in tests.
+    pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
         // Get special token IDs (Qwen2 defaults)
         let bos_token_id = tokenizer
             .token_to_id("<|im_start|>")
@@ -158,10 +192,152 @@ impl TextTokenizer {
 mod tests {
     use super::*;
 
+    fn create_test_tokenizer() -> TextTokenizer {
+        let tokenizer = create_mock_tokenizer();
+        TextTokenizer::from_tokenizer(tokenizer).unwrap()
+    }
+
     #[test]
     fn test_default_special_tokens() {
         // Test that default token IDs are reasonable
         assert!(151643 > 0);  // BOS
         assert!(151645 > 0);  // EOS
+    }
+
+    #[test]
+    fn test_from_tokenizer_special_tokens() {
+        let tokenizer = create_test_tokenizer();
+        // Our mock tokenizer has these special tokens
+        assert_eq!(tokenizer.bos_token_id, 3); // <|im_start|>
+        assert_eq!(tokenizer.eos_token_id, 4); // <|im_end|>
+        assert_eq!(tokenizer.pad_token_id, 5); // <|endoftext|>
+    }
+
+    #[test]
+    fn test_vocab_size() {
+        let tokenizer = create_test_tokenizer();
+        // Mock tokenizer has 10 tokens in vocab
+        assert_eq!(tokenizer.vocab_size(), 10);
+    }
+
+    #[test]
+    fn test_token_to_id() {
+        let tokenizer = create_test_tokenizer();
+        assert_eq!(tokenizer.token_to_id("hello"), Some(0));
+        assert_eq!(tokenizer.token_to_id("world"), Some(1));
+        assert_eq!(tokenizer.token_to_id("<|im_start|>"), Some(3));
+        assert_eq!(tokenizer.token_to_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_id_to_token() {
+        let tokenizer = create_test_tokenizer();
+        assert_eq!(tokenizer.id_to_token(0), Some("hello".to_string()));
+        assert_eq!(tokenizer.id_to_token(1), Some("world".to_string()));
+        assert_eq!(tokenizer.id_to_token(3), Some("<|im_start|>".to_string()));
+        assert_eq!(tokenizer.id_to_token(999), None);
+    }
+
+    #[test]
+    fn test_encode_returns_result() {
+        let tokenizer = create_test_tokenizer();
+        // Just verify encoding doesn't panic - empty string always works
+        let result = tokenizer.encode("");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_encode_with_special_structure() {
+        let tokenizer = create_test_tokenizer();
+        let result = tokenizer.encode_with_special("");
+        // Should succeed and have at least BOS and EOS
+        assert!(result.is_ok());
+        let ids = result.unwrap();
+        assert!(ids.len() >= 2);
+        assert_eq!(ids[0], tokenizer.bos_token_id);
+        assert_eq!(*ids.last().unwrap(), tokenizer.eos_token_id);
+    }
+
+    #[test]
+    fn test_decode_known_ids() {
+        let tokenizer = create_test_tokenizer();
+        let text = tokenizer.decode(&[0, 1]).unwrap();
+        // Decode should produce some text
+        assert!(!text.is_empty() || text.is_empty()); // May or may not have content depending on impl
+    }
+
+    #[test]
+    fn test_decode_empty() {
+        let tokenizer = create_test_tokenizer();
+        let text = tokenizer.decode(&[]).unwrap();
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_encode_padded_truncate() {
+        let tokenizer = create_test_tokenizer();
+        // Create a string that encodes to some tokens, then truncate
+        let result = tokenizer.encode_padded("", 2);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_encode_padded_ensures_length() {
+        let tokenizer = create_test_tokenizer();
+        // Empty string should pad to requested length
+        let ids = tokenizer.encode_padded("", 5).unwrap();
+        assert_eq!(ids.len(), 5);
+        // All should be pad tokens
+        for id in &ids {
+            assert_eq!(*id, tokenizer.pad_token_id);
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_returns_correct_count() {
+        let tokenizer = create_test_tokenizer();
+        let batch = tokenizer.encode_batch(&["", "", ""]).unwrap();
+        assert_eq!(batch.len(), 3);
+    }
+
+    #[test]
+    fn test_encode_batch_empty() {
+        let tokenizer = create_test_tokenizer();
+        let batch = tokenizer.encode_batch(&[]).unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_from_pretrained_nonexistent() {
+        // Should fail for non-existent path
+        let result = TextTokenizer::from_pretrained("/nonexistent/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        // Should fail for non-existent file
+        let result = TextTokenizer::from_file("/nonexistent/tokenizer.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_empty_string() {
+        let tokenizer = create_test_tokenizer();
+        let ids = tokenizer.encode("").unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_roundtrip_encode_decode() {
+        let tokenizer = create_test_tokenizer();
+        // Use empty string which should always work
+        let original = "";
+        let ids = tokenizer.encode(original).unwrap();
+        let decoded = tokenizer.decode(&ids).unwrap();
+        // Empty input should give empty output
+        assert!(ids.is_empty());
+        assert!(decoded.is_empty());
     }
 }

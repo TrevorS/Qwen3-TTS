@@ -212,11 +212,127 @@ impl SpeakerEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::VarMap;
+
+    fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
+        let varmap = VarMap::new();
+        VarBuilder::from_varmap(&varmap, DType::F32, device)
+    }
 
     #[test]
     fn test_speaker_encoder_config() {
         let config = SpeakerEncoderConfig::default();
         assert_eq!(config.embed_dim, 1024);
         assert_eq!(config.input_channels, 128);
+        assert_eq!(config.hidden_dim, 512);
+    }
+
+    #[test]
+    fn test_speaker_encoder_config_clone() {
+        let config = SpeakerEncoderConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.embed_dim, config.embed_dim);
+    }
+
+    #[test]
+    fn test_relu() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[-1.0f32, 0.0, 1.0, 2.0], &device).unwrap();
+        let result = relu(&x).unwrap();
+        let vals: Vec<f32> = result.to_vec1().unwrap();
+        assert!((vals[0] - 0.0).abs() < 1e-6);
+        assert!((vals[1] - 0.0).abs() < 1e-6);
+        assert!((vals[2] - 1.0).abs() < 1e-6);
+        assert!((vals[3] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sigmoid() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[0.0f32], &device).unwrap();
+        let result = sigmoid(&x).unwrap();
+        let vals: Vec<f32> = result.to_vec1().unwrap();
+        assert!((vals[0] - 0.5).abs() < 1e-5); // sigmoid(0) = 0.5
+    }
+
+    #[test]
+    fn test_sigmoid_large_positive() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[10.0f32], &device).unwrap();
+        let result = sigmoid(&x).unwrap();
+        let vals: Vec<f32> = result.to_vec1().unwrap();
+        assert!(vals[0] > 0.99); // sigmoid(10) ≈ 1
+    }
+
+    #[test]
+    fn test_sigmoid_large_negative() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[-10.0f32], &device).unwrap();
+        let result = sigmoid(&x).unwrap();
+        let vals: Vec<f32> = result.to_vec1().unwrap();
+        assert!(vals[0] < 0.01); // sigmoid(-10) ≈ 0
+    }
+
+    #[test]
+    fn test_se_block() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let se = SEBlock::new(64, 8, vb).unwrap();
+
+        // Input: [batch=2, channels=64, time=10]
+        let input = Tensor::randn(0.0f32, 1.0, (2, 64, 10), &device).unwrap();
+        let output = se.forward(&input).unwrap();
+
+        // Output should have same shape
+        assert_eq!(output.dims(), &[2, 64, 10]);
+    }
+
+    #[test]
+    fn test_tdnn_block() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let block = TDNNBlock::new(64, 128, 5, vb).unwrap();
+
+        // Input: [batch=2, channels=64, time=20]
+        let input = Tensor::randn(0.0f32, 1.0, (2, 64, 20), &device).unwrap();
+        let output = block.forward(&input).unwrap();
+
+        // Output should have different channels
+        assert_eq!(output.dims()[0], 2);
+        assert_eq!(output.dims()[1], 128);
+        assert_eq!(output.dims()[2], 20); // Same time due to padding
+    }
+
+    #[test]
+    fn test_attentive_statistics_pooling_construction() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let asp = AttentiveStatisticsPooling::new(64, vb);
+        // Just verify construction succeeds
+        assert!(asp.is_ok());
+    }
+
+    #[test]
+    fn test_speaker_encoder_construction() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+
+        // Smaller config for faster testing
+        let config = SpeakerEncoderConfig {
+            input_channels: 32,
+            hidden_dim: 64,
+            embed_dim: 128,
+        };
+
+        let encoder = SpeakerEncoder::new(config, vb);
+        // Just verify construction succeeds
+        assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn test_speaker_encoder_from_pretrained_not_implemented() {
+        let device = Device::Cpu;
+        let result = SpeakerEncoder::from_pretrained("/some/path", &device);
+        assert!(result.is_err());
     }
 }

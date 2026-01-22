@@ -179,6 +179,23 @@ mod tests {
         let config = GenerationConfig::default();
         assert_eq!(config.max_new_tokens, 2048);
         assert!((config.temperature - 0.7).abs() < 1e-6);
+        assert_eq!(config.top_k, 50);
+        assert!((config.top_p - 0.9).abs() < 1e-6);
+        assert!((config.repetition_penalty - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_generation_config_custom() {
+        let config = GenerationConfig {
+            max_new_tokens: 512,
+            temperature: 0.5,
+            top_k: 10,
+            top_p: 0.8,
+            repetition_penalty: 1.2,
+        };
+        assert_eq!(config.max_new_tokens, 512);
+        assert!((config.temperature - 0.5).abs() < 1e-6);
+        assert_eq!(config.top_k, 10);
     }
 
     #[test]
@@ -191,5 +208,173 @@ mod tests {
         assert!((result[1] - 0.3).abs() < 1e-5);
         assert!((result[2] - 0.6).abs() < 1e-5);
         assert!((result[3] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cumulative_sum_batch() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[[0.25f32, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]], &device).unwrap();
+        let cumsum = cumulative_sum(&x).unwrap();
+        let result: Vec<f32> = cumsum.flatten_all().unwrap().to_vec1().unwrap();
+        // First row
+        assert!((result[0] - 0.25).abs() < 1e-5);
+        assert!((result[1] - 0.50).abs() < 1e-5);
+        assert!((result[2] - 0.75).abs() < 1e-5);
+        assert!((result[3] - 1.00).abs() < 1e-5);
+        // Second row
+        assert!((result[4] - 0.1).abs() < 1e-5);
+        assert!((result[5] - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_greedy_sample() {
+        let device = Device::Cpu;
+        // Logits where position 2 has highest value
+        let logits = Tensor::new(&[[1.0f32, 2.0, 5.0, 1.0]], &device).unwrap();
+        let result = greedy_sample(&logits).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(idx[0], 2); // Index of max
+    }
+
+    #[test]
+    fn test_greedy_sample_batch() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(
+            &[[1.0f32, 5.0, 2.0], [3.0, 1.0, 2.0], [1.0, 2.0, 10.0]],
+            &device,
+        )
+        .unwrap();
+        let result = greedy_sample(&logits).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(idx[0], 1); // Max at position 1
+        assert_eq!(idx[1], 0); // Max at position 0
+        assert_eq!(idx[2], 2); // Max at position 2
+    }
+
+    #[test]
+    fn test_sample_very_low_temperature() {
+        let device = Device::Cpu;
+        // With very low temperature, should act like greedy
+        let logits = Tensor::new(&[[1.0f32, 10.0, 2.0, 1.0]], &device).unwrap();
+        let config = GenerationConfig {
+            temperature: 0.001,
+            ..Default::default()
+        };
+        let result = sample(&logits, &config).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(idx[0], 1); // Should pick the highest
+    }
+
+    #[test]
+    fn test_sample_normal_temperature() {
+        let device = Device::Cpu;
+        // With normal temperature, sampling should work
+        let logits = Tensor::new(&[[1.0f32, 1.0, 1.0, 1.0]], &device).unwrap();
+        let config = GenerationConfig::default();
+        let result = sample(&logits, &config).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        // Should return a valid index
+        assert!(idx[0] < 4);
+    }
+
+    #[test]
+    fn test_sample_temperature_one() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[2.0f32, 2.0, 2.0]], &device).unwrap();
+        let config = GenerationConfig {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let result = sample(&logits, &config).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert!(idx[0] < 3);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_no_penalty() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[1.0f32, 2.0, 3.0]], &device).unwrap();
+        let input_ids = Tensor::new(&[0u32], &device).unwrap();
+        let result = apply_repetition_penalty(&logits, &input_ids, 1.0).unwrap();
+        // With penalty 1.0, should be unchanged
+        let original: Vec<f32> = logits.flatten_all().unwrap().to_vec1().unwrap();
+        let penalized: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((original[0] - penalized[0]).abs() < 1e-5);
+        assert!((original[1] - penalized[1]).abs() < 1e-5);
+        assert!((original[2] - penalized[2]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_with_penalty() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[2.0f32, 3.0, 4.0]], &device).unwrap();
+        let input_ids = Tensor::new(&[0u32], &device).unwrap();
+        let penalty = 2.0;
+        let result = apply_repetition_penalty(&logits, &input_ids, penalty).unwrap();
+        let penalized: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Token 0 had positive logit, should be divided by penalty
+        assert!((penalized[0] - 1.0).abs() < 1e-5); // 2.0 / 2.0 = 1.0
+        // Others unchanged
+        assert!((penalized[1] - 3.0).abs() < 1e-5);
+        assert!((penalized[2] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_negative_logit() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[-2.0f32, 3.0, 4.0]], &device).unwrap();
+        let input_ids = Tensor::new(&[0u32], &device).unwrap();
+        let penalty = 2.0;
+        let result = apply_repetition_penalty(&logits, &input_ids, penalty).unwrap();
+        let penalized: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        // Token 0 had negative logit, should be multiplied by penalty
+        assert!((penalized[0] - (-4.0)).abs() < 1e-5); // -2.0 * 2.0 = -4.0
+    }
+
+    #[test]
+    fn test_rand_f32_range() {
+        // Test that random values are in [0, 1)
+        for _ in 0..100 {
+            let r = rand_f32();
+            assert!(r >= 0.0);
+            assert!(r < 1.0);
+        }
+    }
+
+    #[test]
+    fn test_rand_f32_variability() {
+        // Test that random values vary
+        let values: Vec<f32> = (0..10).map(|_| rand_f32()).collect();
+        let unique: std::collections::HashSet<u32> = values.iter().map(|v| v.to_bits()).collect();
+        // Should have some variation (not all the same)
+        assert!(unique.len() > 1);
+    }
+
+    #[test]
+    fn test_multinomial_sample_deterministic_probs() {
+        let device = Device::Cpu;
+        // Probability of 1.0 on one token
+        let probs = Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap();
+        let result = multinomial_sample(&probs).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(idx[0], 1); // Should always pick index 1
+    }
+
+    #[test]
+    fn test_sample_with_batch() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(
+            &[[10.0f32, 1.0, 1.0], [1.0, 10.0, 1.0]],
+            &device,
+        )
+        .unwrap();
+        let config = GenerationConfig {
+            temperature: 0.001, // Very low temp for deterministic
+            ..Default::default()
+        };
+        let result = sample(&logits, &config).unwrap();
+        let idx: Vec<u32> = result.to_vec1().unwrap();
+        assert_eq!(idx[0], 0);
+        assert_eq!(idx[1], 1);
     }
 }

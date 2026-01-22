@@ -258,6 +258,32 @@ impl MelSpectrogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn test_mel_config_default() {
+        let config = MelConfig::default();
+        assert_eq!(config.sample_rate, 24000);
+        assert_eq!(config.n_fft, 400);
+        assert_eq!(config.hop_length, 160);
+        assert_eq!(config.n_mels, 128);
+        assert!((config.fmin - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mel_config_custom() {
+        let config = MelConfig {
+            sample_rate: 16000,
+            n_fft: 512,
+            hop_length: 256,
+            win_length: Some(512),
+            n_mels: 80,
+            fmin: 80.0,
+            fmax: Some(7600.0),
+        };
+        assert_eq!(config.n_mels, 80);
+        assert_eq!(config.fmax, Some(7600.0));
+    }
 
     #[test]
     fn test_hann_window() {
@@ -268,6 +294,19 @@ mod tests {
     }
 
     #[test]
+    fn test_hann_window_larger() {
+        let window = MelSpectrogram::hann_window(256);
+        assert_eq!(window.len(), 256);
+        // Window starts near zero
+        assert!(window[0] < 0.01);
+        // Peak at center
+        assert!(window[128] > 0.99);
+        // Values are symmetric around center
+        assert!((window[1] - window[255]).abs() < 0.01);
+        assert!((window[64] - window[192]).abs() < 0.01);
+    }
+
+    #[test]
     fn test_mel_filterbank_shape() {
         let mel = MelSpectrogram::new(MelConfig::default());
         assert_eq!(mel.mel_basis.len(), 128);
@@ -275,12 +314,85 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_mel() {
+    fn test_mel_filterbank_triangular() {
+        let mel = MelSpectrogram::new(MelConfig {
+            n_mels: 4,
+            ..Default::default()
+        });
+        // Each filter should have triangular shape (non-negative values)
+        for filter in &mel.mel_basis {
+            for &val in filter {
+                assert!(val >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_mel_silence() {
         let mel = MelSpectrogram::new(MelConfig::default());
-        // 1 second of silence
         let samples = vec![0.0f32; 24000];
         let result = mel.compute(&samples);
         assert!(!result.is_empty());
         assert_eq!(result[0].len(), 128);
+        // Silence should produce very small values
+        for frame in &result {
+            for &val in frame {
+                assert!(val < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_mel_sine_wave() {
+        let mel = MelSpectrogram::new(MelConfig::default());
+        // Generate 440Hz sine wave (A4 note)
+        let samples: Vec<f32> = (0..24000)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 24000.0).sin())
+            .collect();
+        let result = mel.compute(&samples);
+        assert!(!result.is_empty());
+        // Should have non-zero energy
+        let total_energy: f32 = result.iter()
+            .flat_map(|frame| frame.iter())
+            .sum();
+        assert!(total_energy > 0.0);
+    }
+
+    #[test]
+    fn test_compute_log_mel() {
+        let mel = MelSpectrogram::new(MelConfig::default());
+        let samples: Vec<f32> = (0..24000)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 24000.0).sin())
+            .collect();
+        let result = mel.compute_log(&samples);
+        assert!(!result.is_empty());
+        // Log mel should have negative values (log of small numbers)
+        let has_negative = result.iter()
+            .flat_map(|frame| frame.iter())
+            .any(|&v| v < 0.0);
+        assert!(has_negative);
+    }
+
+    #[test]
+    fn test_compute_tensor() {
+        let mel = MelSpectrogram::new(MelConfig::default());
+        let samples = vec![0.0f32; 4800]; // 0.2 seconds
+        let device = Device::Cpu;
+        let tensor = mel.compute_tensor(&samples, &device).unwrap();
+        // Shape should be [n_mels, n_frames]
+        assert_eq!(tensor.dims()[0], 128);
+    }
+
+    #[test]
+    fn test_stft_output_frames() {
+        let mel = MelSpectrogram::new(MelConfig {
+            n_fft: 400,
+            hop_length: 160,
+            ..Default::default()
+        });
+        // With padding, number of frames should be predictable
+        let samples = vec![0.0f32; 1600]; // 10 hops
+        let result = mel.compute(&samples);
+        assert!(result.len() > 0);
     }
 }

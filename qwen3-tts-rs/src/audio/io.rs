@@ -156,11 +156,36 @@ pub fn save_wav<P: AsRef<Path>>(path: P, samples: &[f32], sample_rate: u32) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_audio_buffer_new() {
+        let samples = vec![0.1, 0.2, 0.3];
+        let buffer = AudioBuffer::new(samples.clone(), 16000);
+        assert_eq!(buffer.samples, samples);
+        assert_eq!(buffer.sample_rate, 16000);
+    }
 
     #[test]
     fn test_audio_buffer_duration() {
         let buffer = AudioBuffer::new(vec![0.0; 24000], 24000);
         assert!((buffer.duration() - 1.0).abs() < 1e-6);
+
+        let buffer2 = AudioBuffer::new(vec![0.0; 48000], 24000);
+        assert!((buffer2.duration() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_buffer_len_and_empty() {
+        let buffer = AudioBuffer::new(vec![0.0; 100], 24000);
+        assert_eq!(buffer.len(), 100);
+        assert!(!buffer.is_empty());
+
+        let empty_buffer = AudioBuffer::new(vec![], 24000);
+        assert_eq!(empty_buffer.len(), 0);
+        assert!(empty_buffer.is_empty());
     }
 
     #[test]
@@ -169,5 +194,93 @@ mod tests {
         buffer.normalize();
         assert!((buffer.samples[0] - 1.0).abs() < 1e-6);
         assert!((buffer.samples[1] - (-0.5)).abs() < 1e-6);
+        assert!((buffer.samples[2] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_already_normalized() {
+        let mut buffer = AudioBuffer::new(vec![1.0, -1.0, 0.5], 24000);
+        buffer.normalize();
+        assert!((buffer.samples[0] - 1.0).abs() < 1e-6);
+        assert!((buffer.samples[1] - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_silence() {
+        let mut buffer = AudioBuffer::new(vec![0.0, 0.0, 0.0], 24000);
+        buffer.normalize();
+        // Should not panic, samples remain zero
+        assert!((buffer.samples[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalize_db() {
+        let mut buffer = AudioBuffer::new(vec![0.5, -0.5, 0.25], 24000);
+        buffer.normalize_db(-6.0); // -6 dB ≈ 0.5 amplitude
+        let max_abs = buffer.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!((max_abs - 0.501187).abs() < 0.01); // 10^(-6/20) ≈ 0.501
+    }
+
+    #[test]
+    fn test_to_tensor() {
+        let buffer = AudioBuffer::new(vec![0.1, 0.2, 0.3], 24000);
+        let device = Device::Cpu;
+        let tensor = buffer.to_tensor(&device).unwrap();
+        assert_eq!(tensor.dims(), &[3]);
+        let values: Vec<f32> = tensor.to_vec1().unwrap();
+        assert!((values[0] - 0.1).abs() < 1e-6);
+        assert!((values[1] - 0.2).abs() < 1e-6);
+        assert!((values[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_from_tensor_1d() {
+        let device = Device::Cpu;
+        let tensor = Tensor::new(&[0.1f32, 0.2, 0.3], &device).unwrap();
+        let buffer = AudioBuffer::from_tensor(tensor, 24000).unwrap();
+        assert_eq!(buffer.samples.len(), 3);
+        assert_eq!(buffer.sample_rate, 24000);
+    }
+
+    #[test]
+    fn test_from_tensor_2d() {
+        let device = Device::Cpu;
+        let tensor = Tensor::new(&[[0.1f32, 0.2, 0.3]], &device).unwrap();
+        let buffer = AudioBuffer::from_tensor(tensor, 24000).unwrap();
+        assert_eq!(buffer.samples.len(), 3);
+    }
+
+    #[test]
+    fn test_save_and_load_wav() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.wav");
+
+        let original = AudioBuffer::new(vec![0.1, 0.2, -0.3, 0.4, -0.5], 24000);
+        original.save(&path).unwrap();
+
+        let loaded = AudioBuffer::load(&path).unwrap();
+        assert_eq!(loaded.sample_rate, 24000);
+        assert_eq!(loaded.samples.len(), 5);
+
+        for (a, b) in original.samples.iter().zip(loaded.samples.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_save_wav_function() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test2.wav");
+
+        let samples = vec![0.0, 0.5, 1.0, -0.5, -1.0];
+        save_wav(&path, &samples, 16000).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let result = load_wav("/nonexistent/path/to/file.wav");
+        assert!(result.is_err());
     }
 }

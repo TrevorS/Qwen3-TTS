@@ -353,3 +353,192 @@ impl CodecDecoder {
         Ok(audio.squeeze(1)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
+        let varmap = VarMap::new();
+        VarBuilder::from_varmap(&varmap, DType::F32, device)
+    }
+
+    #[test]
+    fn test_decoder_config_default() {
+        let config = DecoderConfig::default();
+        assert_eq!(config.hidden_size, 1024);
+        assert_eq!(config.num_layers, 8);
+        assert_eq!(config.num_heads, 16);
+        assert_eq!(config.upsample_ratios, vec![4, 5, 8, 3]);
+        assert_eq!(config.num_quantizers, 16);
+        assert_eq!(config.codebook_dim, 256);
+        assert_eq!(config.codebook_size, 2048);
+        assert_eq!(config.out_channels, 1);
+    }
+
+    #[test]
+    fn test_decoder_config_total_upsample() {
+        let config = DecoderConfig::default();
+        let total: usize = config.upsample_ratios.iter().product();
+        assert_eq!(total, 480); // 4 * 5 * 8 * 3 = 480
+    }
+
+    #[test]
+    fn test_upsample_block() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let block = UpsampleBlock::new(64, 32, 8, 4, vb).unwrap();
+
+        // Input: [batch=1, channels=64, len=10]
+        let input = Tensor::randn(0.0f32, 1.0, (1, 64, 10), &device).unwrap();
+        let output = block.forward(&input).unwrap();
+
+        // Output should have half channels and 4x length (due to stride=4)
+        assert_eq!(output.dims()[0], 1);
+        assert_eq!(output.dims()[1], 32);
+        // Length approximately 4x (depends on padding)
+        assert!(output.dims()[2] > 30);
+    }
+
+    #[test]
+    fn test_residual_block() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let block = ResidualBlock::new(64, 7, vb).unwrap();
+
+        // Input: [batch=1, channels=64, len=20]
+        let input = Tensor::randn(0.0f32, 1.0, (1, 64, 20), &device).unwrap();
+        let output = block.forward(&input).unwrap();
+
+        // Output should have same shape (residual connection)
+        assert_eq!(output.dims(), input.dims());
+    }
+
+    #[test]
+    fn test_decoder_attention_construction() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let attn = DecoderAttention::new(128, 8, vb);
+        // Just verify construction succeeds
+        assert!(attn.is_ok());
+    }
+
+    #[test]
+    fn test_decoder_attention_head_dim() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let attn = DecoderAttention::new(256, 16, vb).unwrap();
+
+        assert_eq!(attn.num_heads, 16);
+        assert_eq!(attn.head_dim, 16); // 256 / 16 = 16
+    }
+
+    #[test]
+    fn test_decoder_transformer_layer_construction() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let layer = DecoderTransformerLayer::new(128, 8, vb);
+        // Just verify construction succeeds
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_codec_decoder_small_config() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+
+        // Use a much smaller config for testing
+        let config = DecoderConfig {
+            hidden_size: 32,
+            num_layers: 1,
+            num_heads: 4,
+            upsample_ratios: vec![2, 2], // 4x upsampling
+            num_quantizers: 2,
+            codebook_dim: 16,
+            codebook_size: 64,
+            out_channels: 1,
+        };
+
+        let decoder = CodecDecoder::new(config, vb);
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn test_codec_decoder_decode() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+
+        // Very small config
+        let config = DecoderConfig {
+            hidden_size: 32,
+            num_layers: 1,
+            num_heads: 4,
+            upsample_ratios: vec![2, 2], // 4x upsampling
+            num_quantizers: 2,
+            codebook_dim: 16,
+            codebook_size: 64,
+            out_channels: 1,
+        };
+
+        let decoder = CodecDecoder::new(config, vb).unwrap();
+
+        // Tokens: [batch=1, num_q=2, seq=4]
+        let tokens = Tensor::zeros((1, 2, 4), DType::U32, &device).unwrap();
+        let audio = decoder.decode(&tokens).unwrap();
+
+        // Output should be [batch, samples]
+        assert_eq!(audio.dims()[0], 1);
+        // Length should be approximately 4 * upsampling (4 * 4 = 16)
+        assert!(audio.dims()[1] > 0);
+    }
+
+    #[test]
+    fn test_leaky_relu_in_upsample() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let block = UpsampleBlock::new(32, 16, 4, 2, vb).unwrap();
+
+        // Input with negative values
+        let input = Tensor::new(&[[[- 1.0f32, 1.0, -2.0, 2.0]]], &device).unwrap()
+            .broadcast_as((1, 32, 4)).unwrap();
+        let output = block.forward(&input).unwrap();
+
+        // Just check it runs without error
+        assert!(output.dims()[2] > 0);
+    }
+
+    #[test]
+    fn test_residual_block_preserves_magnitude() {
+        let device = Device::Cpu;
+        let vb = create_mock_vb(&device);
+        let block = ResidualBlock::new(32, 3, vb).unwrap();
+
+        // Create input with known magnitude
+        let input = Tensor::randn(0.0f32, 1.0, (1, 32, 10), &device).unwrap();
+        let input_mean: f32 = input.abs().unwrap().mean_all().unwrap().to_scalar().unwrap();
+
+        let output = block.forward(&input).unwrap();
+        let output_mean: f32 = output.abs().unwrap().mean_all().unwrap().to_scalar().unwrap();
+
+        // Output should have similar magnitude due to residual (not be zero or explode)
+        assert!(output_mean > 0.0);
+        assert!(output_mean < input_mean * 10.0);
+    }
+
+    #[test]
+    fn test_decoder_config_clone() {
+        let config = DecoderConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.hidden_size, config.hidden_size);
+        assert_eq!(cloned.upsample_ratios, config.upsample_ratios);
+    }
+
+    #[test]
+    fn test_decoder_config_debug() {
+        let config = DecoderConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("1024"));
+        assert!(debug_str.contains("hidden_size"));
+    }
+}
