@@ -12,6 +12,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+cli = ["clap", "indicatif"]
 
 [dependencies]
 # Candle ML framework
@@ -50,6 +51,18 @@ indicatif = { version = "0.17", optional = true }
 criterion = "0.5"
 approx = "0.5"
 tempfile = "3.15"
+ndarray = "0.17.2"
+ndarray-npy = "0.10.0"
+
+[[bin]]
+name = "generate_audio"
+path = "src/bin/generate_audio.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "tts_generate"
+path = "src/bin/tts_generate.rs"
+required-features = ["cli"]
 
 [profile.release]
 lto = true
