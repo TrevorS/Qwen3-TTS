@@ -26,16 +26,25 @@ We're porting Qwen3-TTS from Python to Rust using Candle. The approach is method
 - ResidualUnit: SnakeBeta + dilated CausalConv + SnakeBeta + 1x1 CausalConv + residual ✓
 - DecoderBlock: SnakeBeta + CausalTransConv + 3 ResidualUnits (dilations 1, 3, 9) ✓
 - **Full 12Hz Decoder**: quantizer → pre_conv → pre_transformer → upsample stages → decoder blocks → audio (max_diff=0.000003) ✓
+- **End-to-End Pipeline**: text → talker → code_predictor → decoder → audio (max_diff=0.000002) ✓
 
-**See:** `docs/VALIDATION.md` for details, `tests/reference_validation.rs` for tests (22 tests passing)
+**See:** `docs/VALIDATION.md` for details, `tests/reference_validation.rs` for tests (23 tests passing)
 
 ## Next Steps (in order)
 
 1. ~~**Full decoder integration**~~ DONE! ✓
 
-2. **End-to-end test** - Full pipeline
-   - Text → tokenize → talker → code_predictor → decoder → audio
-   - Compare waveform to Python output
+2. ~~**End-to-end test**~~ DONE! ✓
+   - Text → tokenize → talker → code_predictor → decoder → audio (max_diff=0.000002)
+
+**All validation complete!** 23 tests passing with exact Python match.
+
+## Next Steps (optional enhancements)
+
+1. **Autoregressive generation** - Generate multiple frames of audio
+2. **GPU support** - Enable CUDA for faster inference
+3. **Streaming** - Generate audio in real-time as tokens are produced
+4. **API polish** - Create high-level `Qwen3Tts::synthesize()` method
 
 ## How to Work
 
@@ -85,4 +94,4 @@ fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>
 
 ---
 
-**Start with:** Create end-to-end pipeline test (text → tokens → talker → code_predictor → decoder → audio).
+**Status:** Validation complete! All core TTS components are implemented and validated against Python.
