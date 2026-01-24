@@ -10,7 +10,7 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 use super::config::Qwen3TTSConfig;
 use crate::generation::GenerationConfig;
 
-/// Rotary position embedding
+/// Rotary position embedding (standard RoPE)
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
@@ -66,6 +66,158 @@ impl RotaryEmbedding {
             &[
                 &(x1.mul(&cos)? - x2.mul(&sin)?)?,
                 &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+            ],
+            D::Minus1,
+        )?;
+
+        Ok(rotated)
+    }
+}
+
+/// Multimodal Rotary Embedding (MRoPE) for 3D positions (temporal, height, width)
+///
+/// Uses interleaved layout matching Qwen3-TTS's rope_scaling configuration.
+/// For TTS, all 3 position dimensions use the same value, but the interleaving
+/// still affects how frequencies are distributed across the head dimension.
+pub struct MRoPE {
+    inv_freq: Tensor,
+    /// MRoPE section sizes [T, H, W] - stored for potential future use
+    _mrope_section: [usize; 3],
+    /// Precomputed interleaving masks - stored for potential future use
+    _h_mask: Vec<bool>,
+    _w_mask: Vec<bool>,
+    _dim: usize,
+    device: Device,
+}
+
+impl MRoPE {
+    /// Create MRoPE with specified mrope_section
+    ///
+    /// mrope_section = [24, 20, 20] means:
+    /// - 24 frequency pairs for temporal (T)
+    /// - 20 frequency pairs for height (H)
+    /// - 20 frequency pairs for width (W)
+    /// Total = 64 = head_dim / 2
+    pub fn new(
+        dim: usize,
+        theta: f64,
+        mrope_section: [usize; 3],
+        device: &Device,
+    ) -> Result<Self> {
+        let half_dim = dim / 2;
+
+        // Compute inverse frequencies
+        let inv_freq: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
+            .collect();
+        let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
+
+        // Precompute interleaving masks
+        // H mask: positions where index % 3 == 1, up to length mrope_section[1] * 3
+        // W mask: positions where index % 3 == 2, up to length mrope_section[2] * 3
+        let h_length = mrope_section[1] * 3; // 60
+        let w_length = mrope_section[2] * 3; // 60
+
+        let h_mask: Vec<bool> = (0..half_dim)
+            .map(|i| (i % 3 == 1) && (i < h_length))
+            .collect();
+        let w_mask: Vec<bool> = (0..half_dim)
+            .map(|i| (i % 3 == 2) && (i < w_length))
+            .collect();
+
+        Ok(Self {
+            inv_freq,
+            _mrope_section: mrope_section,
+            _h_mask: h_mask,
+            _w_mask: w_mask,
+            _dim: dim,
+            device: device.clone(),
+        })
+    }
+
+    /// Apply MRoPE to query and key tensors
+    ///
+    /// For TTS, all 3 position dimensions (T, H, W) use the same position value,
+    /// but the interleaving still changes how frequencies are distributed.
+    ///
+    /// Arguments:
+    /// - q, k: [batch, heads, seq_len, head_dim]
+    /// - offset: position offset for KV cache
+    /// - seq_len: sequence length
+    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        // Generate position IDs for all 3 dimensions (same values for TTS)
+        let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
+        let pos = Tensor::new(positions.as_slice(), &self.device)?; // [seq_len]
+
+        // Compute frequencies for each dimension
+        // freqs = pos[:, None] * inv_freq[None, :] -> [seq_len, head_dim/2]
+        let pos_col = pos.unsqueeze(1)?; // [seq_len, 1]
+        let inv_freq_row = self.inv_freq.unsqueeze(0)?; // [1, head_dim/2]
+        let freqs = pos_col.matmul(&inv_freq_row)?; // [seq_len, head_dim/2]
+
+        // For TTS, all 3 dimensions have the same position, so freqs_t = freqs_h = freqs_w
+        // But we still need to apply the interleaved layout
+
+        // Apply interleaved MRoPE combination
+        // The Python code does:
+        // freqs_combined = where(h_mask, freqs_h, freqs_t)
+        // freqs_combined = where(w_mask, freqs_w, freqs_combined)
+        //
+        // Since freqs_t = freqs_h = freqs_w for TTS, the result is just freqs!
+        // But we need to match the exact computation for numerical equivalence.
+        let freqs_combined = self.apply_interleaved(&freqs)?;
+
+        // Concatenate for full head_dim: [seq_len, head_dim]
+        let emb = Tensor::cat(&[&freqs_combined, &freqs_combined], 1)?;
+
+        let cos = emb.cos()?;
+        let sin = emb.sin()?;
+
+        // Apply rotation
+        let q_rot = self.rotate(q, &cos, &sin)?;
+        let k_rot = self.rotate(k, &cos, &sin)?;
+
+        Ok((q_rot, k_rot))
+    }
+
+    /// Apply interleaved MRoPE layout
+    ///
+    /// Even though all 3 modalities have the same positions for TTS,
+    /// we still need to match the exact computation for numerical equivalence.
+    fn apply_interleaved(&self, freqs: &Tensor) -> Result<Tensor> {
+        // For TTS where all positions are the same, freqs_t = freqs_h = freqs_w
+        // The interleaving is a no-op in terms of values, but we compute it
+        // the same way as Python for exact numerical match.
+        //
+        // In Python: freqs_combined = where(h_mask, freqs_h, freqs_t)
+        //            freqs_combined = where(w_mask, freqs_w, freqs_combined)
+        // Since freqs_t == freqs_h == freqs_w, result == freqs
+        Ok(freqs.clone())
+    }
+
+    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (_b, _h, _seq, d) = x.dims4()?;
+        let x1 = x.narrow(D::Minus1, 0, d / 2)?;
+        let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
+
+        // cos/sin are [seq_len, head_dim], need [1, 1, seq_len, head_dim]
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+
+        // For rotation, we need half of cos/sin
+        let cos_half = cos.narrow(D::Minus1, 0, d / 2)?;
+        let sin_half = sin.narrow(D::Minus1, 0, d / 2)?;
+
+        let cos_half = cos_half.broadcast_as(x1.shape())?;
+        let sin_half = sin_half.broadcast_as(x1.shape())?;
+
+        // RoPE rotation: rotate_half([x1, x2]) = [-x2, x1]
+        // Result: [x1*cos - x2*sin, x2*cos + x1*sin]
+        let rotated = Tensor::cat(
+            &[
+                &(x1.mul(&cos_half)? - x2.mul(&sin_half)?)?,
+                &(x2.mul(&cos_half)? + x1.mul(&sin_half)?)?,
             ],
             D::Minus1,
         )?;
@@ -314,6 +466,21 @@ impl KVCache {
         };
         self.v = Some(v.clone());
         Ok(v)
+    }
+
+    /// Get K cache sum for debugging
+    pub fn k_sum(&self) -> f32 {
+        self.k.as_ref().map(|k| k.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().sum()).unwrap_or(0.0)
+    }
+
+    /// Get V cache sum for debugging
+    pub fn v_sum(&self) -> f32 {
+        self.v.as_ref().map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().sum()).unwrap_or(0.0)
+    }
+
+    /// Get K cache shape for debugging
+    pub fn k_shape(&self) -> Option<Vec<usize>> {
+        self.k.as_ref().map(|k| k.dims().to_vec())
     }
 
     pub fn reset(&mut self) {

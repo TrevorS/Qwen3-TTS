@@ -44,6 +44,7 @@ pub use audio::AudioBuffer;
 pub use models::config::Qwen3TTSConfig;
 pub use models::Qwen3TTSModel;
 pub use models::{CodePredictor, CodePredictorConfig, TalkerConfig, TalkerModel as Talker};
+pub use models::talker::{Language, Speaker, codec_tokens, special_tokens, tts_tokens};
 
 /// Main TTS interface using proper autoregressive pipeline
 pub struct Qwen3TTS {

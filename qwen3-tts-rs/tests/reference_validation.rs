@@ -1318,6 +1318,7 @@ fn test_code_predictor_module() -> Result<()> {
         rope_theta: 1000000.0,
         vocab_size: 2048,
         num_code_groups: 16,
+        codec_embed_dim: None, // Base model uses hidden_size for codec embeddings
     };
 
     // Load weights into VarBuilder with correct prefix

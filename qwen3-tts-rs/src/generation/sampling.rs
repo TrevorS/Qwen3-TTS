@@ -16,9 +16,16 @@ static RNG_SEEDED: AtomicU64 = AtomicU64::new(0); // 0 = not seeded, 1 = seeded
 ///
 /// After calling this, all sampling operations will be reproducible
 /// for the same seed value.
+///
+/// The seed is mixed with a constant to avoid degenerate states
+/// (e.g., small seeds like 42 producing 0.0 as first output).
 pub fn set_seed(seed: u64) {
+    // Mix seed with PCG increment to get a non-degenerate initial state
+    let mixed_state = seed
+        .wrapping_mul(2685821657736338717)
+        .wrapping_add(1442695040888963407);
     RNG_SEED.store(seed, Ordering::SeqCst);
-    RNG_STATE.store(seed, Ordering::SeqCst);
+    RNG_STATE.store(mixed_state, Ordering::SeqCst);
     RNG_SEEDED.store(1, Ordering::SeqCst);
 }
 
@@ -27,7 +34,11 @@ pub fn set_seed(seed: u64) {
 /// Call this to restart generation with the same sequence of random numbers.
 pub fn reset_rng() {
     let seed = RNG_SEED.load(Ordering::SeqCst);
-    RNG_STATE.store(seed, Ordering::SeqCst);
+    // Apply same mixing as set_seed
+    let mixed_state = seed
+        .wrapping_mul(2685821657736338717)
+        .wrapping_add(1442695040888963407);
+    RNG_STATE.store(mixed_state, Ordering::SeqCst);
 }
 
 /// Clear the seed and return to non-deterministic mode

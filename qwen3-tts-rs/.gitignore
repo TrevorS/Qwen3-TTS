@@ -3,4 +3,17 @@ Cargo.lock
 
 # Downloaded test data (not tracked in git)
 /test_data/
+
+# Python virtual environments
 .venv/
+tools/.venv/
+
+# Generated audio files
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+
+# UV lock file (large, can be regenerated)
+uv.lock

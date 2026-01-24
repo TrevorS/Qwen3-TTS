@@ -16,6 +16,6 @@ pub mod talker;
 
 pub use code_predictor::{CodePredictor, CodePredictorConfig};
 pub use config::Qwen3TTSConfig;
-pub use qwen3_tts::{KVCache, Qwen3TTSModel, RotaryEmbedding};
+pub use qwen3_tts::{KVCache, MRoPE, Qwen3TTSModel, RotaryEmbedding};
 pub use speaker::SpeakerEncoder;
 pub use talker::{TalkerConfig, TalkerModel};

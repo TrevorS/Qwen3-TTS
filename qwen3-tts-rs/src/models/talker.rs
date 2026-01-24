@@ -7,13 +7,122 @@
 //! - 28 transformer decoder layers with KV caching
 //! - Codec embedding for generated tokens (3072 → 1024)
 //! - Codec head for predicting next semantic token (1024 → 3072)
+//!
+//! ## CustomVoice Support
+//!
+//! For CustomVoice models, the input format includes:
+//! - ChatML text tokens: `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
+//! - Codec prefix: `[codec_think, think_bos, language, think_eos]`
+//! - Speaker token embedding
+//! - Codec BOS: `[codec_pad, codec_bos]`
 
 use anyhow::Result;
 use candle_core::{Device, IndexOp, Tensor, D};
 use std::collections::HashMap;
 
-use super::qwen3_tts::{KVCache, RotaryEmbedding};
+use super::qwen3_tts::{KVCache, MRoPE, RotaryEmbedding};
 use crate::generation::GenerationConfig;
+
+/// ChatML special token IDs
+pub mod special_tokens {
+    pub const IM_START: u32 = 151644;
+    pub const IM_END: u32 = 151645;
+    pub const ASSISTANT: u32 = 77091;
+    pub const NEWLINE: u32 = 198;
+}
+
+/// TTS special token IDs (text vocabulary tokens for TTS generation)
+pub mod tts_tokens {
+    pub const TTS_PAD: u32 = 151671;
+    pub const TTS_BOS: u32 = 151672;
+    pub const TTS_EOS: u32 = 151673;
+}
+
+/// Codec special token IDs
+pub mod codec_tokens {
+    pub const CODEC_THINK: u32 = 2154;
+    pub const CODEC_NOTHINK: u32 = 2155;
+    pub const CODEC_THINK_BOS: u32 = 2156;
+    pub const CODEC_THINK_EOS: u32 = 2157;
+    pub const CODEC_PAD: u32 = 2148;
+    pub const CODEC_BOS: u32 = 2149;
+}
+
+/// Language IDs for codec prefix
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Chinese,
+    English,
+    Japanese,
+    Korean,
+    German,
+    French,
+    Russian,
+    Portuguese,
+    Spanish,
+    Italian,
+}
+
+impl Language {
+    /// Get the codec language token ID
+    pub fn token_id(&self) -> u32 {
+        match self {
+            Language::Chinese => 2055,
+            Language::English => 2050,
+            Language::Japanese => 2058,
+            Language::Korean => 2064,
+            Language::German => 2053,
+            Language::French => 2061,
+            Language::Russian => 2069,
+            Language::Portuguese => 2071,
+            Language::Spanish => 2054,
+            Language::Italian => 2070,
+        }
+    }
+}
+
+/// Speaker IDs for CustomVoice model
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    Serena,
+    Vivian,
+    UncleFu,
+    Ryan,
+    Aiden,
+    OnoAnna,
+    Sohee,
+    Eric,
+    Dylan,
+}
+
+impl Speaker {
+    /// Get the speaker token ID
+    pub fn token_id(&self) -> u32 {
+        match self {
+            Speaker::Serena => 3066,
+            Speaker::Vivian => 3065,
+            Speaker::UncleFu => 3010,
+            Speaker::Ryan => 3061,
+            Speaker::Aiden => 2861,
+            Speaker::OnoAnna => 2873,
+            Speaker::Sohee => 2864,
+            Speaker::Eric => 2875,
+            Speaker::Dylan => 2878,
+        }
+    }
+
+    /// Get the native language for this speaker
+    pub fn native_language(&self) -> Language {
+        match self {
+            Speaker::Serena | Speaker::Vivian | Speaker::UncleFu | Speaker::Eric | Speaker::Dylan => {
+                Language::Chinese
+            }
+            Speaker::Ryan | Speaker::Aiden => Language::English,
+            Speaker::OnoAnna => Language::Japanese,
+            Speaker::Sohee => Language::Korean,
+        }
+    }
+}
 
 /// Talker model configuration
 #[derive(Debug, Clone)]
@@ -44,6 +153,9 @@ pub struct TalkerConfig {
     pub max_position_embeddings: usize,
     /// Codec vocabulary size (3072 - includes special tokens)
     pub codec_vocab_size: usize,
+    /// MRoPE section for multimodal rotary embedding [T, H, W]
+    /// None = use standard RoPE, Some([24, 20, 20]) = use interleaved MRoPE
+    pub mrope_section: Option<[usize; 3]>,
 }
 
 impl Default for TalkerConfig {
@@ -62,6 +174,29 @@ impl Default for TalkerConfig {
             rope_theta: 1000000.0,
             max_position_embeddings: 8192,
             codec_vocab_size: 3072,
+            mrope_section: None, // Standard model uses standard RoPE
+        }
+    }
+}
+
+impl TalkerConfig {
+    /// Create config for CustomVoice model (larger hidden dimension, MRoPE)
+    pub fn custom_voice() -> Self {
+        Self {
+            text_vocab_size: 151936,
+            text_embed_dim: 2048,
+            hidden_size: 2048,          // CustomVoice uses 2048
+            text_proj_intermediate: 2048,
+            intermediate_size: 6144,    // CustomVoice uses 6144
+            num_hidden_layers: 28,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1000000.0,
+            max_position_embeddings: 8192,
+            codec_vocab_size: 3072,
+            mrope_section: Some([24, 20, 20]), // CustomVoice uses MRoPE
         }
     }
 }
@@ -131,6 +266,25 @@ impl TextProjection {
     }
 }
 
+/// Either standard RoPE or MRoPE (multimodal)
+pub enum RoPEType {
+    Standard(RotaryEmbedding),
+    Multimodal(MRoPE),
+}
+
+impl RoPEType {
+    /// Apply rotary embedding to Q and K tensors
+    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+        match self {
+            RoPEType::Standard(rope) => rope.apply(q, k, offset),
+            RoPEType::Multimodal(mrope) => {
+                let seq_len = q.dim(2)?;
+                mrope.apply(q, k, offset, seq_len)
+            }
+        }
+    }
+}
+
 /// TalkerModel for autoregressive semantic token generation
 pub struct TalkerModel {
     /// Text embedding [text_vocab_size, text_embed_dim]
@@ -145,8 +299,8 @@ pub struct TalkerModel {
     norm_weight: Tensor,
     /// Codec head [codec_vocab_size, hidden_size]
     codec_head: Tensor,
-    /// Rotary position embedding
-    rope: RotaryEmbedding,
+    /// Rotary position embedding (standard or MRoPE)
+    rope: RoPEType,
     /// Configuration
     config: TalkerConfig,
     /// Device
@@ -255,7 +409,7 @@ impl TalkerDecoderLayer {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        rope: &RotaryEmbedding,
+        rope: &RoPEType,
         attention_mask: Option<&Tensor>,
         kv_cache: Option<&mut KVCache>,
         offset: usize,
@@ -421,13 +575,22 @@ impl TalkerModel {
             .ok_or_else(|| anyhow::anyhow!("Missing talker.codec_head.weight"))?
             .clone();
 
-        // RoPE
-        let rope = RotaryEmbedding::new(
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-            device,
-        )?;
+        // RoPE - use MRoPE if mrope_section is configured
+        let rope = if let Some(mrope_section) = config.mrope_section {
+            RoPEType::Multimodal(MRoPE::new(
+                config.head_dim,
+                config.rope_theta,
+                mrope_section,
+                device,
+            )?)
+        } else {
+            RoPEType::Standard(RotaryEmbedding::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                device,
+            )?)
+        };
 
         Ok(Self {
             text_embedding,
@@ -479,6 +642,166 @@ impl TalkerModel {
         Ok((hidden, logits))
     }
 
+    /// Prefill for CustomVoice model with speaker and language
+    ///
+    /// Constructs the full input sequence matching the Python implementation:
+    /// - Positions 0-2: role prefix (text_proj of im_start, assistant, newline)
+    /// - Positions 3-8: tts_pad/tts_bos ADDED with codec embeddings
+    ///   - 3: tts_pad + codec_think
+    ///   - 4: tts_pad + codec_think_bos
+    ///   - 5: tts_pad + language_id
+    ///   - 6: tts_pad + codec_think_eos
+    ///   - 7: tts_pad + speaker
+    ///   - 8: tts_bos + codec_pad
+    /// - Position 9: first_text_proj + codec_bos
+    ///
+    /// Returns (hidden_states, logits) for generation.
+    pub fn prefill_custom_voice(
+        &self,
+        text_tokens: &[u32],
+        speaker: Speaker,
+        language: Language,
+        kv_caches: &mut [KVCache],
+    ) -> Result<(Tensor, Tensor)> {
+        use codec_tokens::*;
+        use special_tokens::*;
+        use tts_tokens::*;
+
+        // === 1. Role prefix: text_proj([im_start, assistant, newline]) ===
+        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
+        let role_prefix_embed = self.text_embedding.index_select(&role_prefix_ids, 0)?;
+        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
+        let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?; // [1, 3, hidden]
+
+        // === 2. Codec embeddings: [think, think_bos, lang, think_eos, speaker, pad, bos] ===
+        let codec_tokens_list = vec![
+            CODEC_THINK,
+            CODEC_THINK_BOS,
+            language.token_id(),
+            CODEC_THINK_EOS,
+            speaker.token_id(),
+            CODEC_PAD,
+            CODEC_BOS,
+        ];
+        let codec_ids = Tensor::new(codec_tokens_list.as_slice(), &self.device)?;
+        let codec_embed = self.codec_embedding.index_select(&codec_ids, 0)?;
+        let codec_embed = codec_embed.unsqueeze(0)?; // [1, 7, hidden]
+
+        // === 3. TTS pad/bos text embeddings ===
+        // We need 5 tts_pad + 1 tts_bos = 6 total to add with first 6 codec tokens
+        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
+        let tts_pad_embed = self.text_embedding.index_select(&tts_pad_id, 0)?;
+        let tts_pad_embed = tts_pad_embed.unsqueeze(0)?; // [1, 1, embed_dim]
+        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?; // [1, 1, hidden]
+
+        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
+        let tts_bos_embed = self.text_embedding.index_select(&tts_bos_id, 0)?;
+        let tts_bos_embed = tts_bos_embed.unsqueeze(0)?;
+        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?; // [1, 1, hidden]
+
+        // Expand tts_pad to 5 copies and concat with tts_bos
+        let tts_pad_expanded = tts_pad_proj.broadcast_as((1, 5, self.config.hidden_size))?;
+        let tts_text_embed = Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?; // [1, 6, hidden]
+
+        // Add tts text embeddings with first 6 codec embeddings
+        let codec_first6 = codec_embed.i((.., ..6, ..))?; // [1, 6, hidden]
+        let codec_hidden = tts_text_embed.add(&codec_first6)?; // [1, 6, hidden]
+
+        // === 4. Combine role prefix and codec part ===
+        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?; // [1, 9, hidden]
+
+        // === 5. Add first text token (text_proj + codec_bos) ===
+        if !text_tokens.is_empty() {
+            let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
+            let first_text_embed = self.text_embedding.index_select(&first_text_id, 0)?;
+            let first_text_embed = first_text_embed.unsqueeze(0)?;
+            let first_text_proj = self.text_projection.forward(&first_text_embed)?; // [1, 1, hidden]
+
+            // Add with codec_bos (last token of codec_embed)
+            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?; // [1, 1, hidden]
+            let first_combined = first_text_proj.add(&codec_bos_embed)?;
+
+            hidden = Tensor::cat(&[&hidden, &first_combined], 1)?; // [1, 10, hidden]
+        }
+
+        let seq_len = hidden.dim(1)?;
+
+        // Create causal mask
+        let mask = self.create_causal_mask(seq_len, 0)?;
+
+        // Run through all layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        }
+
+        // Final norm
+        hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+
+        // Get logits for last position
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.linear(&last_hidden, &self.codec_head, None)?;
+
+        Ok((hidden, logits))
+    }
+
+    /// Generate semantic tokens with CustomVoice
+    ///
+    /// Full generation loop using CustomVoice prefill.
+    pub fn generate_custom_voice(
+        &self,
+        text_tokens: &[u32],
+        speaker: Speaker,
+        language: Language,
+        config: &GenerationConfig,
+    ) -> Result<Vec<u32>> {
+        let mut kv_caches = self.new_kv_caches();
+
+        // Prefill with CustomVoice format
+        let (_hidden, logits) = self.prefill_custom_voice(text_tokens, speaker, language, &mut kv_caches)?;
+
+        // Calculate offset (text_chatml + codec_prefix + speaker + codec_bos)
+        // ChatML: 3 + text_len + 5 = 8 + text_len
+        // Codec: 4 + 1 + 2 = 7
+        let chatml_len = 3 + text_tokens.len() + 5;
+        let codec_len = 4 + 1 + 2;
+        let mut offset = chatml_len + codec_len;
+
+        // Sample first token
+        let first_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+        let mut generated = vec![first_token_id];
+
+        // Check for EOS
+        if let Some(eos_id) = config.eos_token_id {
+            if first_token_id == eos_id {
+                return Ok(generated);
+            }
+        }
+
+        // Generate remaining tokens
+        for _ in 1..config.max_new_tokens {
+            let prev_token = *generated.last().unwrap();
+            let (_hidden, logits) = self.generate_step(prev_token, &mut kv_caches, offset)?;
+            offset += 1;
+
+            // Sample next token
+            let next_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+            generated.push(next_token_id);
+
+            // Check for EOS
+            if let Some(eos_id) = config.eos_token_id {
+                if next_token_id == eos_id {
+                    break;
+                }
+            }
+        }
+
+        Ok(generated)
+    }
+
     /// Generate next token given previous codec token
     ///
     /// Uses KV cache for efficient autoregressive generation.
@@ -488,15 +811,59 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
         offset: usize,
     ) -> Result<(Tensor, Tensor)> {
+        self.generate_step_with_text(prev_token, kv_caches, offset, None)
+    }
+
+    /// Generate step with optional text embedding to add
+    ///
+    /// For CustomVoice, the text embedding (tts_pad_embed) should be added to the
+    /// codec embedding at each generation step.
+    pub fn generate_step_with_text(
+        &self,
+        prev_token: u32,
+        kv_caches: &mut [KVCache],
+        offset: usize,
+        text_embed: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         // Embed previous codec token
         let token_tensor = Tensor::new(&[prev_token], &self.device)?;
         let token_embed = self.codec_embedding.index_select(&token_tensor, 0)?;
         let mut hidden = token_embed.unsqueeze(0)?; // [1, 1, hidden_size]
 
+        // Add text embedding if provided (for CustomVoice)
+        if let Some(text) = text_embed {
+            hidden = hidden.add(text)?;
+        }
+
+        self.generate_step_with_embed(&hidden, kv_caches, offset)
+    }
+
+    /// Generate step with pre-built input embedding
+    ///
+    /// This allows the caller to build the full input embedding externally
+    /// (e.g., semantic_embed + acoustic_embeds + text_embed for CustomVoice).
+    pub fn generate_step_with_embed(
+        &self,
+        input_embed: &Tensor,
+        kv_caches: &mut [KVCache],
+        offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.generate_step_with_embed_debug(input_embed, kv_caches, offset, false)
+    }
+
+    /// Generate step with debug output
+    pub fn generate_step_with_embed_debug(
+        &self,
+        input_embed: &Tensor,
+        kv_caches: &mut [KVCache],
+        offset: usize,
+        debug: bool,
+    ) -> Result<(Tensor, Tensor)> {
         // Create causal mask for single token (attends to all previous positions)
         let mask = self.create_causal_mask(1, offset)?;
 
         // Run through all layers with KV cache
+        let mut hidden = input_embed.clone();
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(
                 &hidden,
@@ -505,15 +872,82 @@ impl TalkerModel {
                 Some(&mut kv_caches[i]),
                 offset,
             )?;
+
+            if debug && i == 0 {
+                let sum: f32 = hidden.flatten_all()?.to_vec1::<f32>()?.iter().sum();
+                eprintln!("DEBUG: After layer 0, hidden_sum={:.4}", sum);
+            }
         }
 
         // Final norm
+        let hidden_before_norm = hidden.clone();
         hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+
+        if debug {
+            let sum_before: f32 = hidden_before_norm.flatten_all()?.to_vec1::<f32>()?.iter().sum();
+            let sum_after: f32 = hidden.flatten_all()?.to_vec1::<f32>()?.iter().sum();
+            eprintln!("DEBUG: hidden_sum BEFORE norm={:.4}, AFTER norm={:.4}", sum_before, sum_after);
+
+            // Debug codec_head
+            eprintln!("DEBUG: codec_head weight shape: {:?}", self.codec_head.dims());
+            let head_sum: f32 = self.codec_head.flatten_all()?.to_vec1::<f32>()?.iter().sum();
+            eprintln!("DEBUG: codec_head weight sum: {:.4}", head_sum);
+        }
 
         // Get logits
         let logits = self.linear(&hidden, &self.codec_head, None)?;
 
+        if debug {
+            let logits_sum: f32 = logits.flatten_all()?.to_vec1::<f32>()?.iter().sum();
+            eprintln!("DEBUG: logits sum: {:.4}", logits_sum);
+
+            // Check specific logit values
+            let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
+            eprintln!("DEBUG: logits[0:5]: {:?}", &logits_vec[0..5]);
+            eprintln!("DEBUG: logits[210]: {:.4}", logits_vec[210]);
+            eprintln!("DEBUG: logits[415]: {:.4}", logits_vec[415]);
+            eprintln!("DEBUG: logits[1028]: {:.4}", logits_vec[1028]);
+        }
+
         Ok((hidden, logits))
+    }
+
+    /// Get tts_pad text embedding (projected)
+    ///
+    /// This is added to codec embeddings during CustomVoice generation.
+    pub fn get_tts_pad_embed(&self) -> Result<Tensor> {
+        use tts_tokens::TTS_PAD;
+        let pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
+        let pad_embed = self.text_embedding.index_select(&pad_id, 0)?;
+        let pad_embed = pad_embed.unsqueeze(0)?;
+        self.text_projection.forward(&pad_embed)
+    }
+
+    /// Get tts_eos text embedding (projected)
+    ///
+    /// This marks the end of text input.
+    pub fn get_tts_eos_embed(&self) -> Result<Tensor> {
+        use tts_tokens::TTS_EOS;
+        let eos_id = Tensor::new(&[TTS_EOS], &self.device)?;
+        let eos_embed = self.text_embedding.index_select(&eos_id, 0)?;
+        let eos_embed = eos_embed.unsqueeze(0)?;
+        self.text_projection.forward(&eos_embed)
+    }
+
+    /// Get projected text embeddings for a sequence of token IDs
+    ///
+    /// Returns [1, seq_len, hidden_size] tensor of projected text embeddings.
+    pub fn get_projected_text_embeddings(&self, token_ids: &[u32]) -> Result<Tensor> {
+        if token_ids.is_empty() {
+            // Return empty tensor with correct shape
+            return Ok(Tensor::zeros((1, 0, self.config.hidden_size), candle_core::DType::F32, &self.device)?);
+        }
+
+        let ids: Vec<u32> = token_ids.to_vec();
+        let ids_tensor = Tensor::new(ids.as_slice(), &self.device)?;
+        let embeds = self.text_embedding.index_select(&ids_tensor, 0)?;
+        let embeds = embeds.unsqueeze(0)?; // [1, seq_len, text_embed_dim]
+        self.text_projection.forward(&embeds)
     }
 
     /// Full forward pass without KV caching (for testing)

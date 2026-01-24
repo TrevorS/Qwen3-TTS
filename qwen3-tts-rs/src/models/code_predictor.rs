@@ -38,6 +38,9 @@ pub struct CodePredictorConfig {
     pub vocab_size: usize,
     /// Number of code groups (total, including semantic)
     pub num_code_groups: usize,
+    /// Codec embedding dimension (may differ from hidden_size for CustomVoice models)
+    /// When different from hidden_size, a small_to_mtp_projection is used
+    pub codec_embed_dim: Option<usize>,
 }
 
 impl Default for CodePredictorConfig {
@@ -53,6 +56,7 @@ impl Default for CodePredictorConfig {
             rope_theta: 1000000.0,
             vocab_size: 2048,
             num_code_groups: 16,
+            codec_embed_dim: None, // When None, uses hidden_size
         }
     }
 }
@@ -71,6 +75,29 @@ impl CodePredictorConfig {
             rope_theta: config.rope_theta,
             vocab_size: config.codebook_size,
             num_code_groups: config.num_codebook_groups,
+            codec_embed_dim: None,
+        }
+    }
+
+    /// Get the codec embedding dimension (defaults to hidden_size)
+    pub fn codec_embed_dim(&self) -> usize {
+        self.codec_embed_dim.unwrap_or(self.hidden_size)
+    }
+
+    /// Create config for CustomVoice model
+    pub fn custom_voice() -> Self {
+        Self {
+            hidden_size: 1024,
+            intermediate_size: 3072,
+            num_hidden_layers: 5,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1000000.0,
+            vocab_size: 2048,
+            num_code_groups: 16,
+            codec_embed_dim: Some(2048), // CustomVoice uses 2048-dim codec embeddings
         }
     }
 
@@ -95,6 +122,8 @@ impl CodePredictorConfig {
 pub struct CodePredictor {
     /// Codec embeddings for each acoustic group (0-14 for groups 2-16)
     codec_embeddings: Vec<Embedding>,
+    /// Projection from codec_embed_dim to hidden_size (for CustomVoice models)
+    small_to_mtp_projection: Option<Linear>,
     /// Transformer layers
     layers: Vec<DecoderLayer>,
     /// Final normalization
@@ -112,16 +141,29 @@ impl CodePredictor {
     pub fn new(config: CodePredictorConfig, vb: VarBuilder) -> Result<Self> {
         let layer_config = config.to_layer_config();
         let num_acoustic_groups = config.num_code_groups - 1;
+        let codec_embed_dim = config.codec_embed_dim();
 
         // Create codec embeddings (one per acoustic group)
+        // Note: for CustomVoice, codec_embed_dim (2048) differs from hidden_size (1024)
         let mut codec_embeddings = Vec::with_capacity(num_acoustic_groups);
         for i in 0..num_acoustic_groups {
             codec_embeddings.push(embedding(
                 config.vocab_size,
-                config.hidden_size,
+                codec_embed_dim,
                 vb.pp(format!("model.codec_embedding.{}", i)),
             )?);
         }
+
+        // Projection layer for CustomVoice models (2048 -> 1024)
+        let small_to_mtp_projection = if codec_embed_dim != config.hidden_size {
+            Some(candle_nn::linear(
+                codec_embed_dim,
+                config.hidden_size,
+                vb.pp("small_to_mtp_projection"),
+            )?)
+        } else {
+            None
+        };
 
         // Create transformer layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -155,6 +197,7 @@ impl CodePredictor {
 
         Ok(Self {
             codec_embeddings,
+            small_to_mtp_projection,
             layers,
             norm,
             lm_heads,
@@ -183,6 +226,14 @@ impl CodePredictor {
         }
 
         let hidden = Tensor::cat(&inputs, 1)?;
+
+        // Apply projection if needed (CustomVoice: 2048 -> 1024)
+        let hidden = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&hidden)?
+        } else {
+            hidden
+        };
+
         let seq_len = hidden.dim(1)?;
 
         // Create causal mask
@@ -211,8 +262,14 @@ impl CodePredictor {
 
     /// Generate all 15 acoustic tokens given talker hidden state and semantic token
     ///
-    /// The code predictor uses non-autoregressive decoding: all 15 lm_heads
-    /// are applied to the same hidden state (at position 1, the semantic embed position).
+    /// The code predictor uses autoregressive decoding: each acoustic token
+    /// depends on the previous one.
+    ///
+    /// Flow:
+    /// 1. Prefill: [talker_hidden, semantic_embed] → lm_head[0] → acoustic_0
+    /// 2. Step 1: embed(acoustic_0) via codec_embedding[0] → lm_head[1] → acoustic_1
+    /// 3. Step 2: embed(acoustic_1) via codec_embedding[1] → lm_head[2] → acoustic_2
+    /// ... and so on for all 15 acoustic tokens
     ///
     /// # Arguments
     /// * `talker_hidden` - Hidden state from talker model, shape [batch, 1, hidden]
@@ -226,28 +283,72 @@ impl CodePredictor {
         semantic_embed: &Tensor,
     ) -> Result<Vec<u32>> {
         let device = talker_hidden.device();
-        let num_acoustic = self.config.num_code_groups - 1;
+        let num_acoustic = self.config.num_code_groups - 1; // 15 acoustic codes
 
-        // Forward pass with talker hidden + semantic embed
+        // Create KV caches for autoregressive generation
+        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
+            .map(|_| KVCache::new())
+            .collect();
+
+        // === Prefill ===
+        // Input: [talker_hidden, semantic_embed] → shape [1, 2, embed_dim]
         let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
+
+        // Apply projection if needed (CustomVoice: 2048 -> 1024)
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&input)?
+        } else {
+            input
+        };
+
         let seq_len = input.dim(1)?;
         let mask = self.create_causal_mask(seq_len, device)?;
 
         let mut hidden = input;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), None, 0)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
         }
         hidden = self.norm.forward(&hidden)?;
 
-        // Apply all lm_heads to position 1 (semantic embed position) in parallel
-        // This is NON-autoregressive - all acoustic tokens are predicted from the same hidden state
-        let hidden_pos1 = hidden.i((.., 1..2, ..))?;
+        // First acoustic code from lm_head[0] at last position
+        let hidden_last = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.lm_heads[0].forward(&hidden_last)?;
+        let first_code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
 
         let mut codes = Vec::with_capacity(num_acoustic);
-        for group_idx in 0..num_acoustic {
-            let logits = self.lm_heads[group_idx].forward(&hidden_pos1)?;
-            let token: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
-            codes.push(token);
+        codes.push(first_code);
+
+        // === Autoregressive generation for remaining 14 acoustic codes ===
+        let mut prev_code = first_code;
+        let mut offset = seq_len; // Current position for KV cache
+
+        for group_idx in 1..num_acoustic {
+            // Embed previous code with codec_embedding[group_idx - 1]
+            let code_tensor = Tensor::new(&[prev_code], device)?;
+            let code_embed = self.codec_embeddings[group_idx - 1].forward(&code_tensor)?;
+            let code_embed = code_embed.unsqueeze(0)?; // [1, 1, embed_dim]
+
+            // Apply projection if needed
+            let code_embed = if let Some(proj) = &self.small_to_mtp_projection {
+                proj.forward(&code_embed)?
+            } else {
+                code_embed
+            };
+
+            // Forward through layers (single token, using KV cache)
+            let mut hidden = code_embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward(&hidden, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
+            }
+            hidden = self.norm.forward(&hidden)?;
+
+            // Get next acoustic code from lm_head[group_idx]
+            let logits = self.lm_heads[group_idx].forward(&hidden)?;
+            let next_code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
+
+            codes.push(next_code);
+            prev_code = next_code;
+            offset += 1;
         }
 
         Ok(codes)
@@ -265,6 +366,40 @@ impl CodePredictor {
             (1, 1, seq_len, seq_len),
             device,
         )?)
+    }
+
+    /// Get acoustic code embedding for a specific group
+    ///
+    /// group_idx: 0-14 for acoustic groups 2-16
+    /// Returns: [1, 1, codec_embed_dim] tensor
+    pub fn get_acoustic_embedding(&self, code: u32, group_idx: usize, device: &candle_core::Device) -> Result<Tensor> {
+        if group_idx >= self.codec_embeddings.len() {
+            anyhow::bail!("Invalid group_idx {} (max {})", group_idx, self.codec_embeddings.len() - 1);
+        }
+        let code_tensor = Tensor::new(&[code], device)?;
+        let embed = self.codec_embeddings[group_idx].forward(&code_tensor)?;
+        Ok(embed.unsqueeze(0)?) // [1, 1, codec_embed_dim]
+    }
+
+    /// Get sum of all acoustic code embeddings
+    ///
+    /// acoustic_codes: 15 acoustic codes for groups 2-16
+    /// Returns: [1, 1, codec_embed_dim] tensor with summed embeddings
+    pub fn get_acoustic_embeddings_sum(&self, acoustic_codes: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+        if acoustic_codes.len() != self.codec_embeddings.len() {
+            anyhow::bail!("Expected {} acoustic codes, got {}", self.codec_embeddings.len(), acoustic_codes.len());
+        }
+
+        let mut sum: Option<Tensor> = None;
+        for (i, &code) in acoustic_codes.iter().enumerate() {
+            let embed = self.get_acoustic_embedding(code, i, device)?;
+            sum = Some(match sum {
+                Some(s) => s.add(&embed)?,
+                None => embed,
+            });
+        }
+
+        Ok(sum.unwrap())
     }
 }
 
