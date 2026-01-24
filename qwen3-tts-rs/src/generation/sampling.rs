@@ -1,7 +1,49 @@
 //! Token sampling strategies for autoregressive generation
+//!
+//! Supports both deterministic (seeded) and non-deterministic random sampling.
+//! Use `set_seed(seed)` before generation for reproducible outputs.
 
 use anyhow::Result;
 use candle_core::{DType, IndexOp, Tensor, D};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global RNG state
+static RNG_STATE: AtomicU64 = AtomicU64::new(0);
+static RNG_SEED: AtomicU64 = AtomicU64::new(0);
+static RNG_SEEDED: AtomicU64 = AtomicU64::new(0); // 0 = not seeded, 1 = seeded
+
+/// Set the random seed for deterministic generation
+///
+/// After calling this, all sampling operations will be reproducible
+/// for the same seed value.
+pub fn set_seed(seed: u64) {
+    RNG_SEED.store(seed, Ordering::SeqCst);
+    RNG_STATE.store(seed, Ordering::SeqCst);
+    RNG_SEEDED.store(1, Ordering::SeqCst);
+}
+
+/// Reset the RNG to its initial seeded state
+///
+/// Call this to restart generation with the same sequence of random numbers.
+pub fn reset_rng() {
+    let seed = RNG_SEED.load(Ordering::SeqCst);
+    RNG_STATE.store(seed, Ordering::SeqCst);
+}
+
+/// Clear the seed and return to non-deterministic mode
+pub fn clear_seed() {
+    RNG_SEEDED.store(0, Ordering::SeqCst);
+}
+
+/// Check if RNG is currently seeded
+pub fn is_seeded() -> bool {
+    RNG_SEEDED.load(Ordering::SeqCst) != 0
+}
+
+/// Get current seed (returns 0 if not seeded)
+pub fn get_seed() -> u64 {
+    RNG_SEED.load(Ordering::SeqCst)
+}
 
 /// Configuration for autoregressive generation
 #[derive(Debug, Clone)]
@@ -116,24 +158,43 @@ fn multinomial_sample(probs: &Tensor) -> Result<Tensor> {
 }
 
 /// Generate a random f32 in [0, 1)
+///
+/// Uses seeded RNG if `set_seed()` was called, otherwise uses system time.
 fn rand_f32() -> f32 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    if is_seeded() {
+        // Use seeded RNG with PCG-style state update
+        let old_state = RNG_STATE.load(Ordering::Relaxed);
+        // PCG XSH RR 64/32
+        let new_state = old_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        RNG_STATE.store(new_state, Ordering::Relaxed);
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // XSH RR output function
+        let xorshifted = (((old_state >> 18) ^ old_state) >> 27) as u32;
+        let rot = (old_state >> 59) as u32;
+        let output = xorshifted.rotate_right(rot);
 
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos() as u64;
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        (output as f32) / (u32::MAX as f32)
+    } else {
+        // Fall back to system time based RNG
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-    // LCG with seed and counter
-    let state = seed
-        .wrapping_add(count)
-        .wrapping_mul(1103515245)
-        .wrapping_add(12345);
-    (state as f32) / (u64::MAX as f32)
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64;
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // LCG with seed and counter
+        let state = seed
+            .wrapping_add(count)
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345);
+        (state as f32) / (u64::MAX as f32)
+    }
 }
 
 /// Apply repetition penalty to logits
@@ -383,5 +444,114 @@ mod tests {
         let idx: Vec<u32> = result.to_vec1().unwrap();
         assert_eq!(idx[0], 0);
         assert_eq!(idx[1], 1);
+    }
+
+    #[test]
+    fn test_set_seed_deterministic() {
+        // With the same seed, should get the same random values
+        set_seed(12345);
+        let values1: Vec<f32> = (0..10).map(|_| rand_f32()).collect();
+
+        set_seed(12345);
+        let values2: Vec<f32> = (0..10).map(|_| rand_f32()).collect();
+
+        for (a, b) in values1.iter().zip(values2.iter()) {
+            assert!((a - b).abs() < 1e-9, "Seeded values should be identical");
+        }
+
+        clear_seed();
+    }
+
+    #[test]
+    fn test_different_seeds_different_values() {
+        set_seed(12345);
+        let values1: Vec<f32> = (0..10).map(|_| rand_f32()).collect();
+
+        set_seed(67890);
+        let values2: Vec<f32> = (0..10).map(|_| rand_f32()).collect();
+
+        // Values should differ
+        let same_count = values1
+            .iter()
+            .zip(values2.iter())
+            .filter(|(a, b)| (*a - *b).abs() < 1e-9)
+            .count();
+        assert!(same_count < 10, "Different seeds should produce different values");
+
+        clear_seed();
+    }
+
+    #[test]
+    fn test_reset_rng() {
+        set_seed(42);
+        let _first_value = rand_f32();
+        let second_value = rand_f32();
+
+        reset_rng();
+        let after_reset_first = rand_f32();
+        let after_reset_second = rand_f32();
+
+        set_seed(42);
+        let fresh_first = rand_f32();
+        let fresh_second = rand_f32();
+
+        assert!((after_reset_first - fresh_first).abs() < 1e-9);
+        assert!((after_reset_second - fresh_second).abs() < 1e-9);
+        assert!((after_reset_second - second_value).abs() < 1e-9);
+
+        clear_seed();
+    }
+
+    #[test]
+    fn test_seeded_sampling_deterministic() {
+        let device = Device::Cpu;
+        // Uniform-ish logits so sampling isn't just greedy
+        let logits = Tensor::new(&[[1.0f32, 1.0, 1.0, 1.0, 1.0]], &device).unwrap();
+        let config = GenerationConfig {
+            temperature: 1.0,
+            ..Default::default()
+        };
+
+        // Sample multiple times with same seed
+        set_seed(99999);
+        let mut results1 = Vec::new();
+        for _ in 0..5 {
+            let result = sample(&logits, &config).unwrap();
+            results1.push(result.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0]);
+        }
+
+        set_seed(99999);
+        let mut results2 = Vec::new();
+        for _ in 0..5 {
+            let result = sample(&logits, &config).unwrap();
+            results2.push(result.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0]);
+        }
+
+        assert_eq!(results1, results2, "Seeded sampling should be deterministic");
+
+        clear_seed();
+    }
+
+    #[test]
+    fn test_is_seeded() {
+        clear_seed();
+        assert!(!is_seeded());
+
+        set_seed(123);
+        assert!(is_seeded());
+
+        clear_seed();
+        assert!(!is_seeded());
+    }
+
+    #[test]
+    fn test_get_seed() {
+        set_seed(54321);
+        assert_eq!(get_seed(), 54321);
+
+        set_seed(11111);
+        assert_eq!(get_seed(), 11111);
+
+        clear_seed();
     }
 }
