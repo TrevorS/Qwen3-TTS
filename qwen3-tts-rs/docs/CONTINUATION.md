@@ -25,15 +25,13 @@ We're porting Qwen3-TTS from Python to Rust using Candle. The approach is method
 - ConvNeXtBlock: dwconv + LayerNorm + pwconv1 + GELU + pwconv2 + gamma ✓
 - ResidualUnit: SnakeBeta + dilated CausalConv + SnakeBeta + 1x1 CausalConv + residual ✓
 - DecoderBlock: SnakeBeta + CausalTransConv + 3 ResidualUnits (dilations 1, 3, 9) ✓
+- **Full 12Hz Decoder**: quantizer → pre_conv → pre_transformer → upsample stages → decoder blocks → audio (max_diff=0.000003) ✓
 
-**See:** `docs/VALIDATION.md` for details, `tests/reference_validation.rs` for tests (21 tests passing)
+**See:** `docs/VALIDATION.md` for details, `tests/reference_validation.rs` for tests (22 tests passing)
 
 ## Next Steps (in order)
 
-1. **Full decoder integration** - Compose all validated parts into full decoder
-   - quantizer → pre_conv → pre_transformer → output_proj → upsample stages (2x) → decoder.0 (initial conv) → decoder blocks (4x) → decoder.5 (final SnakeBeta) → decoder.6 (final conv) → audio
-   - Wire up all components in CodecDecoder
-   - Export end-to-end reference from Python and validate
+1. ~~**Full decoder integration**~~ DONE! ✓
 
 2. **End-to-end test** - Full pipeline
    - Text → tokenize → talker → code_predictor → decoder → audio
@@ -87,4 +85,4 @@ fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>
 
 ---
 
-**Start with:** Implement causal conv1d, then work through upsampling stages.
+**Start with:** Create end-to-end pipeline test (text → tokens → talker → code_predictor → decoder → audio).

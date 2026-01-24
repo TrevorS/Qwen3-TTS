@@ -2263,3 +2263,311 @@ fn test_full_decoder_12hz() -> Result<()> {
 
     Ok(())
 }
+
+/// Test the full end-to-end TTS pipeline
+/// Text → Talker → Code Predictor → Decoder → Audio
+#[test]
+fn test_e2e_pipeline() -> Result<()> {
+    // Check if end-to-end reference values exist
+    let e2e_audio_path = Path::new(REFERENCE_DIR).join("e2e_audio.bin");
+    if !e2e_audio_path.exists() {
+        eprintln!("End-to-end reference values not found. Run: python3 tools/export_e2e_reference.py");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    println!("\n=== End-to-End TTS Pipeline Validation ===");
+
+    // Constants
+    let batch_size = 1usize;
+    let seq_len = 5usize;
+    let num_heads = 16usize;
+    let num_kv_heads = 8usize;
+    let head_dim = 128usize;
+    let num_layers = 28usize;
+    let rope_theta = 1000000.0f64;
+    let eps = 1e-6;
+    let n_rep = num_heads / num_kv_heads;
+    let scaling = (head_dim as f64).powf(-0.5);
+
+    // Input token IDs (same as Python export)
+    let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?.unsqueeze(0)?;
+    println!("Input IDs: {:?}", input_ids.to_vec2::<u32>()?);
+
+    // ===== Step 1: Text Embedding & Projection =====
+    println!("\n--- Step 1: Text Embedding & Projection ---");
+    let text_embed_w = weights.get("talker.model.text_embedding.weight").unwrap();
+    let text_embeddings = text_embed_w.index_select(&input_ids.flatten_all()?, 0)?
+        .reshape((batch_size, seq_len, 2048))?;
+
+    let fc1_w = weights.get("talker.text_projection.linear_fc1.weight").unwrap();
+    let fc1_b = weights.get("talker.text_projection.linear_fc1.bias").unwrap();
+    let fc2_w = weights.get("talker.text_projection.linear_fc2.weight").unwrap();
+    let fc2_b = weights.get("talker.text_projection.linear_fc2.bias").unwrap();
+
+    let hidden = linear(&text_embeddings, fc1_w, Some(fc1_b))?;
+    let hidden = candle_nn::ops::silu(&hidden)?;
+    let mut hidden = linear(&hidden, fc2_w, Some(fc2_b))?;
+    println!("  After text projection: {:?}", hidden.dims());
+
+    // ===== Step 2: Talker (28-layer transformer) =====
+    println!("\n--- Step 2: Talker (28 layers) ---");
+
+    // Build RoPE
+    let positions = Tensor::arange(0u32, seq_len as u32, &device)?;
+    let inv_freq_vals: Vec<f32> = (0..head_dim)
+        .step_by(2)
+        .map(|i| 1.0 / (rope_theta as f32).powf(i as f32 / head_dim as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq_vals, (head_dim / 2,), &device)?;
+    let positions_f = positions.to_dtype(DType::F32)?;
+    let freqs = positions_f.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+    let cos = freqs.cos()?.repeat((1, 2))?;
+    let sin = freqs.sin()?.repeat((1, 2))?;
+    let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+
+    // Causal mask
+    let mut causal_data = vec![0.0f32; seq_len * seq_len];
+    for i in 0..seq_len {
+        for j in (i + 1)..seq_len {
+            causal_data[i * seq_len + j] = f32::NEG_INFINITY;
+        }
+    }
+    let causal_mask = Tensor::from_vec(causal_data, (seq_len, seq_len), &device)?;
+
+    for layer_idx in 0..num_layers {
+        let input_ln_w = weights.get(&format!("talker.model.layers.{}.input_layernorm.weight", layer_idx)).unwrap();
+        let normed = rms_norm(&hidden, input_ln_w, eps)?;
+
+        let q_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.q_proj.weight", layer_idx)).unwrap();
+        let k_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.k_proj.weight", layer_idx)).unwrap();
+        let v_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.v_proj.weight", layer_idx)).unwrap();
+        let q_norm_w = weights.get(&format!("talker.model.layers.{}.self_attn.q_norm.weight", layer_idx)).unwrap();
+        let k_norm_w = weights.get(&format!("talker.model.layers.{}.self_attn.k_norm.weight", layer_idx)).unwrap();
+
+        let mut q = linear(&normed, q_proj_w, None)?;
+        q = q.reshape((batch_size, seq_len, num_heads, head_dim))?;
+        q = rms_norm(&q, q_norm_w, eps)?;
+        q = q.transpose(1, 2)?;
+
+        let mut k = linear(&normed, k_proj_w, None)?;
+        k = k.reshape((batch_size, seq_len, num_kv_heads, head_dim))?;
+        k = rms_norm(&k, k_norm_w, eps)?;
+        k = k.transpose(1, 2)?;
+
+        let v = linear(&normed, v_proj_w, None)?
+            .reshape((batch_size, seq_len, num_kv_heads, head_dim))?
+            .transpose(1, 2)?;
+
+        // RoPE
+        let q = q.broadcast_mul(&cos)?.broadcast_add(&rotate_half(&q)?.broadcast_mul(&sin)?)?;
+        let k = k.broadcast_mul(&cos)?.broadcast_add(&rotate_half(&k)?.broadcast_mul(&sin)?)?;
+
+        // Repeat KV
+        let k_exp = repeat_kv(&k, n_rep)?;
+        let v_exp = repeat_kv(&v, n_rep)?;
+
+        // Attention
+        let attn_weights = q.matmul(&k_exp.transpose(2, 3)?)?.affine(scaling, 0.0)?;
+        let attn_weights = attn_weights.broadcast_add(&causal_mask)?;
+        let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_probs.matmul(&v_exp)?;
+
+        // O projection
+        let o_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.o_proj.weight", layer_idx)).unwrap();
+        let attn_output_flat = attn_output.transpose(1, 2)?
+            .reshape((batch_size, seq_len, num_heads * head_dim))?;
+        let attn_proj = linear(&attn_output_flat, o_proj_w, None)?;
+        hidden = (hidden + attn_proj)?;
+
+        // MLP
+        let post_ln_w = weights.get(&format!("talker.model.layers.{}.post_attention_layernorm.weight", layer_idx)).unwrap();
+        let mlp_input = rms_norm(&hidden, post_ln_w, eps)?;
+
+        let gate_w = weights.get(&format!("talker.model.layers.{}.mlp.gate_proj.weight", layer_idx)).unwrap();
+        let up_w = weights.get(&format!("talker.model.layers.{}.mlp.up_proj.weight", layer_idx)).unwrap();
+        let down_w = weights.get(&format!("talker.model.layers.{}.mlp.down_proj.weight", layer_idx)).unwrap();
+
+        let gate = linear(&mlp_input, gate_w, None)?;
+        let up = linear(&mlp_input, up_w, None)?;
+        let mlp_hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
+        let mlp_output = linear(&mlp_hidden, down_w, None)?;
+        hidden = (hidden + mlp_output)?;
+    }
+
+    // Final norm
+    let final_norm_w = weights.get("talker.model.norm.weight").unwrap();
+    let hidden = rms_norm(&hidden, final_norm_w, eps)?;
+
+    // Codec head -> semantic tokens
+    let codec_head_w = weights.get("talker.codec_head.weight").unwrap();
+    let codec_logits = linear(&hidden, codec_head_w, None)?;
+    let semantic_tokens = codec_logits.argmax(2)?;
+    println!("  Semantic tokens: {:?}", semantic_tokens.to_vec2::<u32>()?);
+
+    // ===== Step 3: Code Predictor =====
+    println!("\n--- Step 3: Code Predictor (5 layers) ---");
+
+    let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+    let last_semantic: u32 = semantic_tokens.i((0, seq_len - 1))?.to_scalar()?;
+
+    let codec_embed_w = weights.get("talker.model.codec_embedding.weight").unwrap();
+    let semantic_embed = codec_embed_w.i(last_semantic as usize)?
+        .unsqueeze(0)?.unsqueeze(0)?;
+
+    let cp_input = Tensor::cat(&[&last_hidden, &semantic_embed], 1)?;
+    let cp_seq_len = cp_input.dim(1)?;
+
+    // Build RoPE for code predictor
+    let cp_positions = Tensor::arange(0u32, cp_seq_len as u32, &device)?;
+    let cp_positions_f = cp_positions.to_dtype(DType::F32)?;
+    let cp_freqs = cp_positions_f.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+    let cp_cos = cp_freqs.cos()?.repeat((1, 2))?.unsqueeze(0)?.unsqueeze(0)?;
+    let cp_sin = cp_freqs.sin()?.repeat((1, 2))?.unsqueeze(0)?.unsqueeze(0)?;
+
+    let mut cp_causal_data = vec![0.0f32; cp_seq_len * cp_seq_len];
+    for i in 0..cp_seq_len {
+        for j in (i + 1)..cp_seq_len {
+            cp_causal_data[i * cp_seq_len + j] = f32::NEG_INFINITY;
+        }
+    }
+    let cp_causal = Tensor::from_vec(cp_causal_data, (cp_seq_len, cp_seq_len), &device)?;
+
+    let mut cp_hidden = cp_input;
+
+    for layer_idx in 0..5 {
+        let prefix = format!("talker.code_predictor.model.layers.{}", layer_idx);
+
+        let input_ln_w = weights.get(&format!("{}.input_layernorm.weight", prefix)).unwrap();
+        let normed = rms_norm(&cp_hidden, input_ln_w, eps)?;
+
+        let q_proj_w = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)).unwrap();
+        let k_proj_w = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)).unwrap();
+        let v_proj_w = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)).unwrap();
+        let q_norm_w = weights.get(&format!("{}.self_attn.q_norm.weight", prefix)).unwrap();
+        let k_norm_w = weights.get(&format!("{}.self_attn.k_norm.weight", prefix)).unwrap();
+
+        let mut q = linear(&normed, q_proj_w, None)?;
+        q = q.reshape((1, cp_seq_len, num_heads, head_dim))?;
+        q = rms_norm(&q, q_norm_w, eps)?;
+        q = q.transpose(1, 2)?;
+
+        let mut k = linear(&normed, k_proj_w, None)?;
+        k = k.reshape((1, cp_seq_len, num_kv_heads, head_dim))?;
+        k = rms_norm(&k, k_norm_w, eps)?;
+        k = k.transpose(1, 2)?;
+
+        let v = linear(&normed, v_proj_w, None)?
+            .reshape((1, cp_seq_len, num_kv_heads, head_dim))?
+            .transpose(1, 2)?;
+
+        // RoPE
+        let q = q.broadcast_mul(&cp_cos)?.broadcast_add(&rotate_half(&q)?.broadcast_mul(&cp_sin)?)?;
+        let k = k.broadcast_mul(&cp_cos)?.broadcast_add(&rotate_half(&k)?.broadcast_mul(&cp_sin)?)?;
+
+        // Repeat KV
+        let k_exp = repeat_kv(&k, n_rep)?;
+        let v_exp = repeat_kv(&v, n_rep)?;
+
+        // Attention
+        let attn_weights = q.matmul(&k_exp.transpose(2, 3)?)?.affine(scaling, 0.0)?;
+        let attn_weights = attn_weights.broadcast_add(&cp_causal)?;
+        let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_probs.matmul(&v_exp)?;
+
+        // O projection
+        let o_proj_w = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)).unwrap();
+        let attn_output_flat = attn_output.transpose(1, 2)?
+            .reshape((1, cp_seq_len, num_heads * head_dim))?;
+        let attn_proj = linear(&attn_output_flat, o_proj_w, None)?;
+        cp_hidden = (cp_hidden + attn_proj)?;
+
+        // MLP
+        let post_ln_w = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)).unwrap();
+        let mlp_input = rms_norm(&cp_hidden, post_ln_w, eps)?;
+
+        let gate_w = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)).unwrap();
+        let up_w = weights.get(&format!("{}.mlp.up_proj.weight", prefix)).unwrap();
+        let down_w = weights.get(&format!("{}.mlp.down_proj.weight", prefix)).unwrap();
+
+        let gate = linear(&mlp_input, gate_w, None)?;
+        let up = linear(&mlp_input, up_w, None)?;
+        let mlp_hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
+        let mlp_output = linear(&mlp_hidden, down_w, None)?;
+        cp_hidden = (cp_hidden + mlp_output)?;
+    }
+
+    // Final norm
+    let cp_norm_w = weights.get("talker.code_predictor.model.norm.weight").unwrap();
+    let cp_hidden = rms_norm(&cp_hidden, cp_norm_w, eps)?;
+
+    // Generate acoustic tokens
+    let mut acoustic_tokens = Vec::with_capacity(15);
+    for i in 0..15 {
+        let lm_head_w = weights.get(&format!("talker.code_predictor.lm_head.{}.weight", i)).unwrap();
+        let logits = linear(&cp_hidden.i((.., 1..2, ..))?, lm_head_w, None)?;
+        let token: u32 = logits.argmax(2)?.squeeze(0)?.squeeze(0)?.to_scalar()?;
+        acoustic_tokens.push(token);
+    }
+    println!("  Acoustic tokens: {:?}", acoustic_tokens);
+
+    // ===== Step 4: Build codes tensor =====
+    println!("\n--- Step 4: Build codes for decoder ---");
+
+    let mut codes_data = vec![0i64; 16];
+    codes_data[0] = last_semantic as i64;
+    for (i, &tok) in acoustic_tokens.iter().enumerate() {
+        codes_data[i + 1] = tok as i64;
+    }
+    let codes = Tensor::from_vec(codes_data, (1, 16, 1), &device)?;
+    println!("  Codes shape: {:?}", codes.dims());
+
+    // ===== Step 5: Decoder =====
+    println!("\n--- Step 5: Decoder ---");
+
+    // Use the validated Decoder12Hz
+    use qwen3_tts::models::codec::Decoder12Hz;
+
+    let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
+    let rust_audio = decoder.decode(&codes)?;
+
+    println!("  Rust audio shape: {:?}", rust_audio.dims());
+
+    // Load Python reference
+    let python_audio = load_reference("e2e_audio.bin", &[1, 1, 1920], &device)?;
+    println!("  Python audio shape: {:?}", python_audio.dims());
+
+    compare_tensors("e2e_audio", &rust_audio, &python_audio)?;
+
+    let diff = (&rust_audio - &python_audio)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+
+    // Use tolerance for full pipeline (error accumulates through many layers)
+    assert!(
+        max_diff < 0.01,
+        "End-to-end audio should match within 0.01, got {}",
+        max_diff
+    );
+
+    println!("  END-TO-END PIPELINE PASS!");
+
+    Ok(())
+}
