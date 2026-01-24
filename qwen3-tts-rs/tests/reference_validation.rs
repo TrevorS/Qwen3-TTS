@@ -2187,3 +2187,79 @@ fn test_decoder_block() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_full_decoder_12hz() -> Result<()> {
+    // Test the full 12Hz decoder end-to-end against Python reference
+    use qwen3_tts::models::codec::{Decoder12Hz, Decoder12HzConfig};
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("decoder_output.bin")
+        .exists()
+    {
+        eprintln!(
+            "Decoder output reference not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== Full 12Hz Decoder Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    println!("  Loaded {} tensors", st_weights.len());
+
+    // Create decoder
+    let config = Decoder12HzConfig::default();
+    let decoder = Decoder12Hz::from_weights(&st_weights, config)?;
+
+    println!("  Decoder created successfully");
+    println!("  Total upsample factor: {}", decoder.total_upsample());
+
+    // Create test codes: [batch=1, num_quantizers=16, seq_len=2]
+    let codes = Tensor::zeros((1, 16, 2), DType::U32, &device)?;
+
+    println!("  Input codes shape: {:?}", codes.dims());
+
+    // Run decoder
+    let rust_output = decoder.decode(&codes)?;
+
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    // Load Python reference: [1, 1, 3840]
+    let python_output = load_reference("decoder_output.bin", &[1, 1, 3840], &device)?;
+
+    println!("  Python output shape: {:?}", python_output.dims());
+
+    compare_tensors("decoder_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+
+    // Allow slightly larger tolerance for full decoder (multi-layer forward)
+    assert!(
+        max_diff < 1e-2,
+        "Full decoder output should match within 1e-2, got {}",
+        max_diff
+    );
+
+    println!("  FULL 12Hz DECODER PASS!");
+
+    Ok(())
+}

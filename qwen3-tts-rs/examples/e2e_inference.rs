@@ -241,7 +241,7 @@ fn main() -> Result<()> {
         let repeated: Vec<Tensor> = (0..n_kv)
             .flat_map(|i| {
                 let slice = x.narrow(0, i, 1).unwrap();
-                std::iter::repeat(slice).take(repeats)
+                std::iter::repeat_n(slice, repeats)
             })
             .collect();
         Ok(Tensor::cat(&repeated, 0)?)
