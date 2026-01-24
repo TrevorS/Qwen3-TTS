@@ -1403,10 +1403,17 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
     // ===== 1. Quantizer decode =====
     println!("  Testing quantizer decode...");
 
-    // Get codebooks
-    let first_codebook = st_weights
+    // Get codebooks - normalize by cluster_usage as per official implementation
+    // embedding = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
+    let epsilon = 1e-7f32;
+    let first_embedding_sum = st_weights
         .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum")
         .unwrap();
+    let first_cluster_usage = st_weights
+        .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
+        .unwrap();
+    let first_cluster_usage_clamped = first_cluster_usage.clamp(epsilon, f32::MAX)?;
+    let first_codebook = first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
 
     // Look up embeddings and sum
     let mut embeddings = Vec::new();
@@ -1420,12 +1427,20 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
 
     // Rest quantizers
     for i in 0..15 {
-        let cb = st_weights
+        let embedding_sum = st_weights
             .get(&format!(
                 "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.embedding_sum",
                 i
             ))
             .unwrap();
+        let cluster_usage = st_weights
+            .get(&format!(
+                "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.cluster_usage",
+                i
+            ))
+            .unwrap();
+        let cluster_usage_clamped = cluster_usage.clamp(epsilon, f32::MAX)?;
+        let cb = embedding_sum.broadcast_div(&cluster_usage_clamped.unsqueeze(1)?)?;
         let c = codes.i((.., i + 1, ..))?;
         let embed =
             cb.index_select(&c.flatten_all()?, 0)?
@@ -2170,8 +2185,9 @@ fn test_decoder_block() -> Result<()> {
 
     println!("  Rust output shape: {:?}", rust_output.dims());
 
-    // Load Python reference: [1, 768, 64]
-    let python_output = load_reference("decoder_decoder_1.bin", &[1, 768, 64], &device)?;
+    // Load Python reference: [1, 768, 56]
+    // With proper causal trimming: input=8, rate=8, kernel=16 -> (8-1)*8 = 56
+    let python_output = load_reference("decoder_decoder_1.bin", &[1, 768, 56], &device)?;
 
     compare_tensors("decoder_block_output", &rust_output, &python_output)?;
 
@@ -2233,7 +2249,8 @@ fn test_full_decoder_12hz() -> Result<()> {
     println!("  Total upsample factor: {}", decoder.total_upsample());
 
     // Create test codes: [batch=1, num_quantizers=16, seq_len=2]
-    let codes = Tensor::zeros((1, 16, 2), DType::U32, &device)?;
+    // Use I64 since decoder does modulo operations
+    let codes = Tensor::zeros((1, 16, 2), DType::I64, &device)?;
 
     println!("  Input codes shape: {:?}", codes.dims());
 
@@ -2242,8 +2259,10 @@ fn test_full_decoder_12hz() -> Result<()> {
 
     println!("  Rust output shape: {:?}", rust_output.dims());
 
-    // Load Python reference: [1, 1, 3840]
-    let python_output = load_reference("decoder_output.bin", &[1, 1, 3840], &device)?;
+    // Load Python reference: [1, 1, 3285]
+    // Note: 3285 samples = official model output for 2 frames with proper trimming
+    // (kernel-stride trimmed from BOTH left and right sides)
+    let python_output = load_reference("decoder_output.bin", &[1, 1, 3285], &device)?;
 
     println!("  Python output shape: {:?}", python_output.dims());
 
@@ -2260,6 +2279,98 @@ fn test_full_decoder_12hz() -> Result<()> {
     );
 
     println!("  FULL 12Hz DECODER PASS!");
+
+    Ok(())
+}
+
+/// Test decoder with 50-frame reference that has semantic tokens > 2047
+#[test]
+fn test_decoder_with_sentence_codes() -> Result<()> {
+    use ndarray::Array2;
+    use ndarray_npy::ReadNpyExt;
+    use qwen3_tts::models::codec::{Decoder12Hz, Decoder12HzConfig};
+
+    // Check if reference codes exist
+    let codes_path = Path::new("test_data/reference_sentence/codes_seed42_frames50.npy");
+    if !codes_path.exists() {
+        eprintln!("Reference sentence codes not found");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    println!("\n=== Decoder with 50-frame Sentence Codes ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Create decoder
+    let config = Decoder12HzConfig::default();
+    let decoder = Decoder12Hz::from_weights(&st_weights, config)?;
+
+    // Load reference codes from npy file
+    let file = std::fs::File::open(codes_path)?;
+    let codes_array: Array2<i64> = Array2::read_npy(file)?;
+
+    println!("  Codes shape: {:?}", codes_array.shape());
+
+    // Check semantic token range
+    let semantic_tokens: Vec<i64> = codes_array.row(0).iter().copied().collect();
+    let min_semantic = *semantic_tokens.iter().min().unwrap();
+    let max_semantic = *semantic_tokens.iter().max().unwrap();
+    let over_2047: usize = semantic_tokens.iter().filter(|&&x| x >= 2048).count();
+
+    println!("  Semantic tokens: min={}, max={}", min_semantic, max_semantic);
+    println!(
+        "  Tokens >= 2048: {} out of {}",
+        over_2047,
+        semantic_tokens.len()
+    );
+
+    // Convert to tensor [1, 16, 50]
+    let (nq, seq) = (codes_array.shape()[0], codes_array.shape()[1]);
+    let flat: Vec<i64> = codes_array.iter().copied().collect();
+    let codes = Tensor::from_vec(flat, (1, nq, seq), &device)?;
+
+    println!("  Input tensor shape: {:?}", codes.dims());
+
+    // Run decoder - this tests the modulo handling for tokens > 2047
+    let audio = decoder.decode(&codes)?;
+
+    println!("  Audio shape: {:?}", audio.dims());
+    // With proper causal trimming, output is slightly shorter than 50 * 1920
+    let min_expected = 50 * 1800; // Approximate lower bound
+    let max_expected = 50 * 1920; // Theoretical maximum
+    let actual_samples = audio.dim(2)?;
+    assert!(
+        actual_samples >= min_expected && actual_samples <= max_expected,
+        "Expected samples in range [{}, {}] for 50 frames, got {}",
+        min_expected, max_expected, actual_samples
+    );
+
+    let audio_flat: Vec<f32> = audio.flatten_all()?.to_vec1()?;
+    let abs_mean: f32 = audio_flat.iter().map(|x| x.abs()).sum::<f32>() / audio_flat.len() as f32;
+    println!("  Audio abs mean: {:.6}", abs_mean);
+
+    // Audio should be in valid range
+    let audio_min = audio_flat.iter().cloned().fold(f32::INFINITY, f32::min);
+    let audio_max = audio_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    assert!(audio_min >= -1.0 && audio_max <= 1.0, "Audio should be in [-1, 1]");
+    println!("  Audio range: [{:.6}, {:.6}]", audio_min, audio_max);
+
+    println!("  DECODER WITH SENTENCE CODES PASS!");
+    println!("  (Modulo handling for semantic tokens > 2047 works correctly)");
 
     Ok(())
 }
@@ -2552,7 +2663,8 @@ fn test_e2e_pipeline() -> Result<()> {
     println!("  Rust audio shape: {:?}", rust_audio.dims());
 
     // Load Python reference
-    let python_audio = load_reference("e2e_audio.bin", &[1, 1, 1920], &device)?;
+    // Note: 1365 samples = official decoder output for 1 frame with proper trimming
+    let python_audio = load_reference("e2e_audio.bin", &[1, 1, 1365], &device)?;
     println!("  Python audio shape: {:?}", python_audio.dims());
 
     compare_tensors("e2e_audio", &rust_audio, &python_audio)?;
@@ -2568,6 +2680,354 @@ fn test_e2e_pipeline() -> Result<()> {
     );
 
     println!("  END-TO-END PIPELINE PASS!");
+
+    Ok(())
+}
+
+// ============================================================================
+// TALKER MODEL TESTS
+// ============================================================================
+
+#[test]
+fn test_talker_model_forward() -> Result<()> {
+    // Test the TalkerModel forward pass against Python reference
+    use qwen3_tts::models::talker::TalkerModel;
+
+    if !reference_available() {
+        eprintln!("Reference values not found. Run: python3 tools/export_reference_values.py");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    println!("\n=== TalkerModel Forward Validation ===");
+
+    // Create talker model
+    let talker = TalkerModel::from_weights(&weights, &device)?;
+    println!("  TalkerModel created with {} layers", talker.config().num_hidden_layers);
+
+    // Input: "Hello, this is a" = [9707, 11, 419, 374, 264]
+    let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?.unsqueeze(0)?;
+    println!("  Input IDs shape: {:?}", input_ids.dims());
+
+    // Run forward pass (no KV cache)
+    let logits = talker.forward(&input_ids)?;
+    println!("  Output logits shape: {:?}", logits.dims());
+
+    // Compare with Python reference (codec_logits.bin)
+    let python_logits = load_reference("codec_logits.bin", &[1, 5, 3072], &device)?;
+
+    compare_tensors("talker_logits", &logits, &python_logits)?;
+
+    let diff = (&logits - &python_logits)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+
+    // Allow tolerance for accumulated error over 28 layers
+    assert!(
+        max_diff < 1e-3,
+        "TalkerModel logits should match within 1e-3, got {}",
+        max_diff
+    );
+
+    // Verify predictions match
+    let rust_preds = logits.argmax(candle_core::D::Minus1)?;
+    let rust_preds_vec: Vec<u32> = rust_preds.flatten_all()?.to_vec1()?;
+    println!("  Rust predictions: {:?}", rust_preds_vec);
+
+    // Expected from Python: [1501, 1231, 1732, 1353, 963]
+    let expected = vec![1501u32, 1231, 1732, 1353, 963];
+    assert_eq!(rust_preds_vec, expected, "Predictions should match Python");
+
+    println!("  TALKER MODEL FORWARD PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_talker_model_prefill() -> Result<()> {
+    // Test the TalkerModel prefill with KV caching
+    use qwen3_tts::models::talker::TalkerModel;
+    use qwen3_tts::models::KVCache;
+
+    if !reference_available() {
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    println!("\n=== TalkerModel Prefill Validation ===");
+
+    // Create talker model
+    let talker = TalkerModel::from_weights(&weights, &device)?;
+
+    // Create KV caches
+    let mut kv_caches: Vec<KVCache> = talker.new_kv_caches();
+
+    // Input: "Hello, this is a" = [9707, 11, 419, 374, 264]
+    let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?.unsqueeze(0)?;
+
+    // Prefill
+    let (hidden, logits) = talker.prefill(&input_ids, &mut kv_caches)?;
+    println!("  Hidden shape: {:?}", hidden.dims());
+    println!("  Logits shape: {:?}", logits.dims());
+
+    // The logits from prefill should be for the last position only
+    // Get the last position logits from Python reference
+    let python_logits = load_reference("codec_logits.bin", &[1, 5, 3072], &device)?;
+    let python_last_logits = python_logits.i((.., 4..5, ..))?;
+
+    compare_tensors("prefill_logits", &logits, &python_last_logits)?;
+
+    let diff = (&logits - &python_last_logits)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-3,
+        "Prefill logits should match within 1e-3, got {}",
+        max_diff
+    );
+
+    println!("  TALKER MODEL PREFILL PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_talker_model_text_embedding() -> Result<()> {
+    // Test the text embedding matches reference
+    if !reference_available() {
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    println!("\n=== TalkerModel Text Embedding Validation ===");
+
+    // Directly test text embedding against Python reference
+    let text_embed_weight = weights
+        .get("talker.model.text_embedding.weight")
+        .ok_or_else(|| anyhow::anyhow!("text_embedding not found"))?;
+
+    let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?;
+    let rust_embeddings = text_embed_weight.index_select(&input_ids, 0)?;
+    let rust_embeddings = rust_embeddings.unsqueeze(0)?;
+
+    let python_embeddings = load_reference("text_embeddings.bin", &[1, 5, 2048], &device)?;
+
+    compare_tensors("text_embeddings", &rust_embeddings, &python_embeddings)?;
+
+    assert!(tensors_close(&rust_embeddings, &python_embeddings, 1e-5, 1e-6)?);
+    println!("  TEXT EMBEDDING PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_talker_model_construction() -> Result<()> {
+    // Test that TalkerModel can be constructed from weights
+    use qwen3_tts::models::talker::TalkerModel;
+
+    if !reference_available() {
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    println!("\n=== TalkerModel Construction Validation ===");
+
+    // Create talker model
+    let talker = TalkerModel::from_weights(&weights, &device)?;
+
+    // Verify config
+    let config = talker.config();
+    assert_eq!(config.text_vocab_size, 151936);
+    assert_eq!(config.hidden_size, 1024);
+    assert_eq!(config.num_hidden_layers, 28);
+    assert_eq!(config.num_attention_heads, 16);
+    assert_eq!(config.num_key_value_heads, 8);
+    assert_eq!(config.head_dim, 128);
+
+    println!("  Config: {} layers, {} heads, {} kv_heads, {} head_dim",
+             config.num_hidden_layers, config.num_attention_heads,
+             config.num_key_value_heads, config.head_dim);
+
+    println!("  TALKER MODEL CONSTRUCTION PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_autoregressive_generation() -> Result<()> {
+    // Test the full autoregressive pipeline:
+    // Text → TalkerModel → CodePredictor → Decoder → Audio
+    use qwen3_tts::models::talker::TalkerModel;
+    use qwen3_tts::models::code_predictor::{CodePredictor, CodePredictorConfig};
+    use qwen3_tts::models::codec::Decoder12Hz;
+    use qwen3_tts::models::KVCache;
+    use qwen3_tts::generation::{GenerationConfig, sample};
+    use candle_nn::VarBuilder;
+
+    if !reference_available() {
+        eprintln!("Reference values not found. Run: python3 tools/export_reference_values.py");
+        return Ok(());
+    }
+
+    // Check if decoder reference exists
+    if !Path::new(REFERENCE_DIR).join("decoder_output.bin").exists() {
+        eprintln!("Decoder reference not found. Run: python3 tools/export_decoder_reference.py");
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+    let weights = load_weights(&device)?;
+
+    // Load speech tokenizer weights for decoder
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    if !st_path.exists() {
+        eprintln!("Speech tokenizer weights not found at {:?}", st_path);
+        return Ok(());
+    }
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    println!("\n=== Autoregressive Generation Validation ===");
+
+    // Create TalkerModel
+    let talker = TalkerModel::from_weights(&weights, &device)?;
+    println!("  TalkerModel created with {} layers", talker.config().num_hidden_layers);
+
+    // Create CodePredictor
+    let cp_config = CodePredictorConfig::default();
+    // Filter weights for code predictor and remove prefix
+    let cp_weights: HashMap<String, Tensor> = weights
+        .iter()
+        .filter_map(|(k, v)| {
+            if k.starts_with("talker.code_predictor.") {
+                Some((k.strip_prefix("talker.code_predictor.").unwrap().to_string(), v.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let cp_vb = VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+    let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
+    println!("  CodePredictor created");
+
+    // Create Decoder12Hz
+    let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
+    println!("  Decoder12Hz created");
+
+    // Input: "Hello" = [9707]
+    let input_ids = Tensor::new(&[9707u32], &device)?.unsqueeze(0)?;
+    println!("  Input IDs: {:?}", input_ids.dims());
+
+    // Create KV caches for talker
+    let mut talker_kv_caches: Vec<KVCache> = talker.new_kv_caches();
+
+    // Prefill talker with text
+    let (hidden, logits) = talker.prefill(&input_ids, &mut talker_kv_caches)?;
+    let mut offset = input_ids.dim(1)?;
+    println!("  After prefill: hidden {:?}, logits {:?}", hidden.dims(), logits.dims());
+
+    // Get hidden state for last position (input to code predictor)
+    let seq_len = hidden.dim(1)?;
+    let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+
+    // Generation config (low temp for reproducibility)
+    let gen_config = GenerationConfig {
+        max_new_tokens: 5,
+        temperature: 0.001, // Essentially greedy
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        eos_token_id: None,
+    };
+
+    // Sample first semantic token
+    let first_token = sample(&logits.squeeze(1)?, &gen_config)?;
+    let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+    println!("  First semantic token: {}", first_token_id);
+
+    // Generate 5 frames
+    let mut all_codes: Vec<Vec<u32>> = Vec::new();
+
+    // First frame
+    let semantic_embed = talker.get_codec_embedding(first_token_id)?;
+    let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+    println!("  Frame 0: semantic={}, acoustics={:?}", first_token_id, &acoustic_codes[..3]);
+    let mut frame_codes = vec![first_token_id];
+    frame_codes.extend(acoustic_codes);
+    all_codes.push(frame_codes);
+
+    // Generate remaining frames
+    for frame_idx in 1..5 {
+        let prev_token = all_codes.last().unwrap()[0];
+        let (hidden, logits) = talker.generate_step(prev_token, &mut talker_kv_caches, offset)?;
+        offset += 1;
+        last_hidden = hidden;
+
+        // Sample semantic token
+        let next_token = sample(&logits.squeeze(1)?, &gen_config)?;
+        let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+        // Generate acoustic tokens
+        let semantic_embed = talker.get_codec_embedding(next_token_id)?;
+        let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        println!("  Frame {}: semantic={}, acoustics={:?}", frame_idx, next_token_id, &acoustic_codes[..3]);
+        let mut frame_codes = vec![next_token_id];
+        frame_codes.extend(acoustic_codes);
+        all_codes.push(frame_codes);
+    }
+
+    // Convert to tensor [1, 16, num_frames]
+    let num_frames = all_codes.len();
+    let mut data = vec![0i64; 16 * num_frames];
+    for (frame, frame_codes) in all_codes.iter().enumerate() {
+        for (q, &code) in frame_codes.iter().enumerate() {
+            data[q * num_frames + frame] = code as i64;
+        }
+    }
+    let codes = Tensor::from_vec(data, (1, 16, num_frames), &device)?;
+    println!("  Codes tensor shape: {:?}", codes.dims());
+
+    // Decode to audio
+    let audio = decoder.decode(&codes)?;
+    println!("  Audio shape: {:?}", audio.dims());
+
+    // Verify audio is non-zero
+    let audio_abs_mean: f32 = audio.abs()?.mean_all()?.to_scalar()?;
+    println!("  Audio abs mean: {:.6}", audio_abs_mean);
+    assert!(
+        audio_abs_mean > 1e-6,
+        "Audio should not be all zeros"
+    );
+
+    // Verify audio length is reasonable (5 frames at 12.5Hz ≈ 0.4s ≈ 9000+ samples at 24kHz)
+    // With proper causal trimming, output is slightly shorter than num_frames * 1920
+    // due to (input-1)*stride behavior in decoder blocks
+    let min_expected = num_frames * 1800; // Approximate lower bound
+    let max_expected = num_frames * 1920; // Theoretical maximum
+    let actual_samples = audio.dim(2)?;
+    assert!(
+        actual_samples >= min_expected && actual_samples <= max_expected,
+        "Expected samples in range [{}, {}], got {}",
+        min_expected, max_expected, actual_samples
+    );
+
+    println!("  AUTOREGRESSIVE GENERATION PASS!");
 
     Ok(())
 }
