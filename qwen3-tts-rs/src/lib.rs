@@ -8,6 +8,13 @@
 //! - **CUDA**: NVIDIA GPU acceleration
 //! - **Metal**: Apple Silicon GPU acceleration
 //!
+//! ## Architecture
+//!
+//! The TTS pipeline consists of:
+//! 1. **TalkerModel**: Generates semantic tokens from text autoregressively
+//! 2. **CodePredictor**: Generates acoustic tokens (15) for each semantic token
+//! 3. **Decoder12Hz**: Converts codec tokens to audio waveform
+//!
 //! ## Example
 //!
 //! ```rust,ignore
@@ -24,15 +31,285 @@ pub mod models;
 pub mod tokenizer;
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
+use std::collections::HashMap;
+use std::path::Path;
+
+use models::codec::Decoder12Hz;
+use models::talker::TalkerModel;
+use models::KVCache;
 
 /// Re-exports for convenience
 pub use audio::AudioBuffer;
 pub use models::config::Qwen3TTSConfig;
 pub use models::Qwen3TTSModel;
+pub use models::{CodePredictor, CodePredictorConfig, TalkerConfig, TalkerModel as Talker};
 
-/// Main TTS interface
+/// Main TTS interface using proper autoregressive pipeline
 pub struct Qwen3TTS {
+    /// Talker model for semantic token generation
+    talker: TalkerModel,
+    /// Code predictor for acoustic token generation
+    code_predictor: CodePredictor,
+    /// 12Hz decoder for audio synthesis
+    decoder: Decoder12Hz,
+    /// Text tokenizer
+    text_tokenizer: tokenizer::TextTokenizer,
+    /// Device to run inference on
+    device: Device,
+}
+
+impl Qwen3TTS {
+    /// Load a model from a HuggingFace model ID or local path
+    pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
+        tracing::info!("Loading Qwen3-TTS from: {}", model_id);
+
+        // Load text tokenizer
+        let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(model_id)?;
+
+        // Load model weights
+        let model_path = Path::new(model_id).join("model.safetensors");
+        if !model_path.exists() {
+            anyhow::bail!(
+                "Model weights not found at {}. Please download the model first.",
+                model_path.display()
+            );
+        }
+
+        let weights = Self::load_weights(&model_path, &device)?;
+
+        // Create TalkerModel
+        let talker = TalkerModel::from_weights(&weights, &device)?;
+
+        // Create CodePredictor
+        let cp_config = CodePredictorConfig::default();
+        let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
+
+        // Load speech tokenizer for decoder
+        let st_path = Path::new(model_id).join("speech_tokenizer/model.safetensors");
+        let st_weights = if st_path.exists() {
+            Self::load_weights(&st_path, &device)?
+        } else {
+            // Fall back to looking in parent dir
+            let alt_path = Path::new(model_id)
+                .parent()
+                .map(|p| p.join("speech_tokenizer/model.safetensors"));
+            if let Some(p) = alt_path {
+                if p.exists() {
+                    Self::load_weights(&p, &device)?
+                } else {
+                    anyhow::bail!("Speech tokenizer weights not found");
+                }
+            } else {
+                anyhow::bail!("Speech tokenizer weights not found");
+            }
+        };
+
+        // Create Decoder12Hz
+        let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
+
+        Ok(Self {
+            talker,
+            code_predictor,
+            decoder,
+            text_tokenizer,
+            device,
+        })
+    }
+
+    /// Load from pre-loaded weight tensors
+    pub fn from_weights(
+        model_weights: &HashMap<String, Tensor>,
+        decoder_weights: &HashMap<String, Tensor>,
+        text_tokenizer: tokenizer::TextTokenizer,
+        device: &Device,
+    ) -> Result<Self> {
+        // Create TalkerModel
+        let talker = TalkerModel::from_weights(model_weights, device)?;
+
+        // Create CodePredictor
+        let cp_config = CodePredictorConfig::default();
+        let cp_weights = Self::filter_weights(model_weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, device);
+        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
+
+        // Create Decoder12Hz
+        let decoder = Decoder12Hz::from_weights(decoder_weights, Default::default())?;
+
+        Ok(Self {
+            talker,
+            code_predictor,
+            decoder,
+            text_tokenizer,
+            device: device.clone(),
+        })
+    }
+
+    /// Synthesize speech from text using proper autoregressive pipeline
+    ///
+    /// Pipeline:
+    /// 1. Tokenize text
+    /// 2. Prefill TalkerModel with text tokens
+    /// 3. Autoregressively generate semantic tokens
+    /// 4. For each semantic token, generate 15 acoustic tokens via CodePredictor
+    /// 5. Decode accumulated codes to audio via Decoder12Hz
+    pub fn synthesize(&self, text: &str, options: Option<SynthesisOptions>) -> Result<AudioBuffer> {
+        let options = options.unwrap_or_default();
+
+        // Tokenize text
+        let input_ids = self.text_tokenizer.encode(text)?;
+        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+
+        // Generate codes using proper pipeline
+        let codes = self.generate_codes(
+            &input_tensor,
+            &generation::GenerationConfig {
+                max_new_tokens: options.max_length,
+                temperature: options.temperature,
+                top_k: options.top_k,
+                top_p: options.top_p,
+                repetition_penalty: options.repetition_penalty,
+                eos_token_id: options.eos_token_id,
+            },
+        )?;
+
+        // Decode to audio
+        let waveform = self.decoder.decode(&codes)?;
+
+        AudioBuffer::from_tensor(waveform, 24000)
+    }
+
+    /// Generate codec tokens using proper autoregressive pipeline
+    ///
+    /// Returns tensor of shape [batch, 16, num_frames]
+    pub fn generate_codes(
+        &self,
+        input_ids: &Tensor,
+        config: &generation::GenerationConfig,
+    ) -> Result<Tensor> {
+        let mut talker_kv_caches: Vec<KVCache> = self.talker.new_kv_caches();
+
+        // Prefill talker with text
+        let (hidden, logits) = self.talker.prefill(input_ids, &mut talker_kv_caches)?;
+        let mut offset = input_ids.dim(1)?;
+
+        // Get hidden state for last position (input to code predictor)
+        let seq_len = hidden.dim(1)?;
+        let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+
+        // Sample first semantic token
+        let first_token = generation::sample(&logits.squeeze(1)?, config)?;
+        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+        // Check for EOS
+        if let Some(eos_id) = config.eos_token_id {
+            if first_token_id == eos_id {
+                // Return empty codes
+                return Ok(Tensor::zeros((1, 16, 0), DType::I64, &self.device)?);
+            }
+        }
+
+        // Collect all frames: Vec<[semantic, acoustic_0..14]>
+        let mut all_codes: Vec<Vec<u32>> = Vec::new();
+
+        // Generate first frame's acoustic tokens
+        let semantic_embed = self.talker.get_codec_embedding(first_token_id)?;
+        let acoustic_codes = self.code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        let mut frame_codes = vec![first_token_id];
+        frame_codes.extend(acoustic_codes);
+        all_codes.push(frame_codes);
+
+        // Generate remaining frames
+        for _ in 1..config.max_new_tokens {
+            // Generate next semantic token
+            let prev_token = all_codes.last().unwrap()[0];
+            let (hidden, logits) = self.talker.generate_step(prev_token, &mut talker_kv_caches, offset)?;
+            offset += 1;
+            last_hidden = hidden;
+
+            // Sample semantic token
+            let next_token = generation::sample(&logits.squeeze(1)?, config)?;
+            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+            // Check for EOS
+            if let Some(eos_id) = config.eos_token_id {
+                if next_token_id == eos_id {
+                    break;
+                }
+            }
+
+            // Generate acoustic tokens for this frame
+            let semantic_embed = self.talker.get_codec_embedding(next_token_id)?;
+            let acoustic_codes = self.code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+            let mut frame_codes = vec![next_token_id];
+            frame_codes.extend(acoustic_codes);
+            all_codes.push(frame_codes);
+        }
+
+        // Convert to tensor [1, 16, num_frames]
+        self.codes_to_tensor(&all_codes)
+    }
+
+    /// Convert list of frame codes to tensor [batch, 16, num_frames]
+    fn codes_to_tensor(&self, codes: &[Vec<u32>]) -> Result<Tensor> {
+        let num_frames = codes.len();
+        if num_frames == 0 {
+            return Ok(Tensor::zeros((1, 16, 0), DType::I64, &self.device)?);
+        }
+
+        let mut data = vec![0i64; 16 * num_frames];
+        for (frame, frame_codes) in codes.iter().enumerate() {
+            for (q, &code) in frame_codes.iter().enumerate() {
+                // Layout: [q0_f0, q0_f1, ...], [q1_f0, q1_f1, ...], ...
+                data[q * num_frames + frame] = code as i64;
+            }
+        }
+
+        Ok(Tensor::from_vec(data, (1, 16, num_frames), &self.device)?)
+    }
+
+    /// Get the device this model is running on
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Load weights from safetensors file
+    fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+        let tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
+        // Convert BF16 to F32
+        let tensors: HashMap<String, Tensor> = tensors
+            .into_iter()
+            .map(|(name, tensor)| {
+                let converted = if tensor.dtype() == DType::BF16 {
+                    tensor.to_dtype(DType::F32).unwrap()
+                } else {
+                    tensor
+                };
+                (name, converted)
+            })
+            .collect();
+        Ok(tensors)
+    }
+
+    /// Filter weights by prefix, removing the prefix from keys
+    fn filter_weights(weights: &HashMap<String, Tensor>, prefix: &str) -> HashMap<String, Tensor> {
+        weights
+            .iter()
+            .filter_map(|(k, v)| {
+                if k.starts_with(prefix) {
+                    Some((k.strip_prefix(prefix).unwrap().to_string(), v.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Legacy Qwen3TTS that uses the old pipeline (for backwards compatibility)
+pub struct Qwen3TTSLegacy {
     /// The underlying model
     model: Qwen3TTSModel,
     /// Text tokenizer
@@ -43,10 +320,10 @@ pub struct Qwen3TTS {
     device: Device,
 }
 
-impl Qwen3TTS {
+impl Qwen3TTSLegacy {
     /// Load a model from a HuggingFace model ID or local path
     pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
-        tracing::info!("Loading Qwen3-TTS from: {}", model_id);
+        tracing::info!("Loading Qwen3-TTS (legacy) from: {}", model_id);
 
         // Load config
         let config = Qwen3TTSConfig::from_pretrained(model_id)?;
@@ -75,7 +352,7 @@ impl Qwen3TTS {
 
         // Tokenize text
         let input_ids = self.text_tokenizer.encode(text)?;
-        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?; // Add batch dimension
+        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
 
         // Generate codec tokens
         let codec_tokens = self.model.generate(

@@ -211,6 +211,9 @@ impl CodePredictor {
 
     /// Generate all 15 acoustic tokens given talker hidden state and semantic token
     ///
+    /// The code predictor uses non-autoregressive decoding: all 15 lm_heads
+    /// are applied to the same hidden state (at position 1, the semantic embed position).
+    ///
     /// # Arguments
     /// * `talker_hidden` - Hidden state from talker model, shape [batch, 1, hidden]
     /// * `semantic_embed` - Embedding of semantic token, shape [batch, 1, hidden]
@@ -225,55 +228,24 @@ impl CodePredictor {
         let device = talker_hidden.device();
         let num_acoustic = self.config.num_code_groups - 1;
 
-        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
-            .map(|_| KVCache::new())
-            .collect();
-
-        // Prefill with talker hidden + semantic embed
-        let prefill_input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
-        let seq_len = prefill_input.dim(1)?;
+        // Forward pass with talker hidden + semantic embed
+        let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
+        let seq_len = input.dim(1)?;
         let mask = self.create_causal_mask(seq_len, device)?;
 
-        let mut hidden = prefill_input;
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        let mut hidden = input;
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), None, 0)?;
         }
         hidden = self.norm.forward(&hidden)?;
 
-        // Get first acoustic token from position 1 (semantic embed position)
-        let logits = self.lm_heads[0].forward(&hidden.i((.., 1..2, ..))?)?;
-        let token_0: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
+        // Apply all lm_heads to position 1 (semantic embed position) in parallel
+        // This is NON-autoregressive - all acoustic tokens are predicted from the same hidden state
+        let hidden_pos1 = hidden.i((.., 1..2, ..))?;
 
-        let mut codes = vec![token_0];
-        let mut offset = seq_len;
-
-        // Generate remaining tokens autoregressively
-        for group_idx in 1..num_acoustic {
-            // Get embedding of previous token
-            let prev_code = codes[group_idx - 1];
-            let prev_embed = self.codec_embeddings[group_idx - 1]
-                .forward(&Tensor::new(&[prev_code], device)?)?
-                .unsqueeze(0)?;
-
-            // Extend mask for new position
-            offset += 1;
-            let mask = self.create_causal_mask(1, device)?;
-
-            // Forward through layers with KV cache
-            let mut h = prev_embed;
-            for (i, layer) in self.layers.iter().enumerate() {
-                h = layer.forward(
-                    &h,
-                    &self.rope,
-                    Some(&mask),
-                    Some(&mut kv_caches[i]),
-                    offset - 1,
-                )?;
-            }
-            h = self.norm.forward(&h)?;
-
-            // Get next token
-            let logits = self.lm_heads[group_idx].forward(&h)?;
+        let mut codes = Vec::with_capacity(num_acoustic);
+        for group_idx in 0..num_acoustic {
+            let logits = self.lm_heads[group_idx].forward(&hidden_pos1)?;
             let token: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
             codes.push(token);
         }
