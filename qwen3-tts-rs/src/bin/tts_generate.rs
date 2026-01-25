@@ -13,6 +13,7 @@ use qwen3_tts::generation::{
     TtsTokenIds,
 };
 use qwen3_tts::models::codec::Decoder12Hz;
+use qwen3_tts::tokenizer;
 use qwen3_tts::AudioBuffer;
 
 #[derive(Parser, Debug)]
@@ -45,25 +46,10 @@ struct Args {
     /// Output WAV file
     #[arg(short, long, default_value = "test_data/tts_output.wav")]
     output: String,
-}
 
-/// Simple text to token mapping (raw text tokens only)
-fn text_to_raw_ids(text: &str) -> Vec<u32> {
-    match text {
-        "Hello" => vec![9707],
-        "Hello world" => vec![9707, 1917],
-        "Hello, this is a" => vec![9707, 11, 419, 374, 264],
-        "Hello, this is a test" => vec![9707, 11, 419, 374, 264, 1273],
-        _ => {
-            eprintln!("Warning: Unknown text '{}', using 'Hello'", text);
-            vec![9707]
-        }
-    }
-}
-
-/// Get raw text token IDs (build_prefill_embeddings adds ChatML structure)
-fn text_to_ids(text: &str) -> Vec<u32> {
-    text_to_raw_ids(text)
+    /// Tokenizer directory (defaults to model_dir/../tokenizer)
+    #[arg(long)]
+    tokenizer_dir: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -131,8 +117,20 @@ fn main() -> Result<()> {
     println!("  hidden_size: {}", hidden_size);
     println!("  codec_vocab_size: {}", vocab_size);
 
-    // Get text tokens
-    let text_tokens = text_to_ids(&args.text);
+    // Load tokenizer
+    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| {
+        Path::new(&args.model_dir)
+            .parent()
+            .map(|p| p.join("tokenizer"))
+            .unwrap_or_else(|| Path::new("tokenizer").to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    });
+    println!("Loading tokenizer from {}...", tokenizer_dir);
+    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+
+    // Tokenize text
+    let text_tokens = text_tokenizer.encode(&args.text)?;
     println!("\nText tokens: {:?}", text_tokens);
 
     // Build TTS config
@@ -211,7 +209,8 @@ fn main() -> Result<()> {
 
     for frame in 0..args.frames {
         // Get hidden states for current sequence
-        let (hidden_states, _) = run_talker_forward(&current_inputs, &weights, hidden_size, &device)?;
+        let (hidden_states, _) =
+            run_talker_forward(&current_inputs, &weights, hidden_size, &device)?;
         let last_hidden = hidden_states.i((.., hidden_states.dim(1)? - 1.., ..))?;
 
         // Sample semantic token
@@ -293,7 +292,12 @@ fn main() -> Result<()> {
     let codes_i64: Vec<i64> = codes_tensor.flatten_all()?.to_vec1()?;
     let codes_bytes: Vec<u8> = codes_i64.iter().flat_map(|&x| x.to_le_bytes()).collect();
     std::fs::write(codes_path, &codes_bytes)?;
-    println!("Saved codes to: {} ({} codes, {} bytes)", codes_path, codes_i64.len(), codes_bytes.len());
+    println!(
+        "Saved codes to: {} ({} codes, {} bytes)",
+        codes_path,
+        codes_i64.len(),
+        codes_bytes.len()
+    );
 
     // Decode to audio
     println!("Decoding to audio...");
@@ -365,17 +369,23 @@ fn run_talker_forward(
         // QKV projections
         let q = linear_3d(
             &normed,
-            weights.get(&format!("{}.self_attn.q_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.q_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
         let k = linear_3d(
             &normed,
-            weights.get(&format!("{}.self_attn.k_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.k_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
         let v = linear_3d(
             &normed,
-            weights.get(&format!("{}.self_attn.v_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.v_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
 
@@ -387,12 +397,16 @@ fn run_talker_forward(
         // QK norm
         let q = rms_norm(
             &q,
-            weights.get(&format!("{}.self_attn.q_norm.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.q_norm.weight", prefix))
+                .unwrap(),
             eps,
         )?;
         let k = rms_norm(
             &k,
-            weights.get(&format!("{}.self_attn.k_norm.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.k_norm.weight", prefix))
+                .unwrap(),
             eps,
         )?;
 
@@ -413,7 +427,9 @@ fn run_talker_forward(
 
         // Attention
         let scale = (head_dim as f64).powf(-0.5);
-        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?.affine(scale, 0.0)?;
+        let attn = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
+            .affine(scale, 0.0)?;
         let attn = attn.broadcast_add(&mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let attn_out = attn.matmul(&v)?;
@@ -426,7 +442,9 @@ fn run_talker_forward(
         // O projection
         let attn_out = linear_3d(
             &attn_out,
-            weights.get(&format!("{}.self_attn.o_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.self_attn.o_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
 
@@ -441,18 +459,24 @@ fn run_talker_forward(
 
         let gate = linear_3d(
             &normed,
-            weights.get(&format!("{}.mlp.gate_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
         let up = linear_3d(
             &normed,
-            weights.get(&format!("{}.mlp.up_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.mlp.up_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
         let mlp_out = candle_nn::ops::silu(&gate)?.mul(&up)?;
         let mlp_out = linear_3d(
             &mlp_out,
-            weights.get(&format!("{}.mlp.down_proj.weight", prefix)).unwrap(),
+            weights
+                .get(&format!("{}.mlp.down_proj.weight", prefix))
+                .unwrap(),
             None,
         )?;
 
@@ -513,9 +537,7 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
 
 fn create_causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
     let mask: Vec<f32> = (0..seq_len)
-        .flat_map(|i| {
-            (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY })
-        })
+        .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
         .collect();
     Ok(Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)?)
 }
@@ -532,7 +554,9 @@ fn run_code_predictor(
         .get("talker.model.codec_embedding.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing codec_embedding"))?;
     let semantic_idx = Tensor::new(&[semantic_token], device)?;
-    let semantic_embed = codec_embedding.index_select(&semantic_idx, 0)?.unsqueeze(0)?;
+    let semantic_embed = codec_embedding
+        .index_select(&semantic_idx, 0)?
+        .unsqueeze(0)?;
     // [1, 1, hidden_size]
 
     // Concatenate talker_hidden + semantic_embed
@@ -577,18 +601,30 @@ fn run_code_predictor(
         let normed = rms_norm(&hidden, ln_w, eps)?;
 
         // Self-attention
-        let q_proj = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)).unwrap();
-        let k_proj = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)).unwrap();
-        let v_proj = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)).unwrap();
-        let o_proj = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)).unwrap();
+        let q_proj = weights
+            .get(&format!("{}.self_attn.q_proj.weight", prefix))
+            .unwrap();
+        let k_proj = weights
+            .get(&format!("{}.self_attn.k_proj.weight", prefix))
+            .unwrap();
+        let v_proj = weights
+            .get(&format!("{}.self_attn.v_proj.weight", prefix))
+            .unwrap();
+        let o_proj = weights
+            .get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .unwrap();
 
         let q = linear_3d(&normed, q_proj, None)?;
         let k = linear_3d(&normed, k_proj, None)?;
         let v = linear_3d(&normed, v_proj, None)?;
 
         // Q/K norms
-        let q_norm_w = weights.get(&format!("{}.self_attn.q_norm.weight", prefix)).unwrap();
-        let k_norm_w = weights.get(&format!("{}.self_attn.k_norm.weight", prefix)).unwrap();
+        let q_norm_w = weights
+            .get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .unwrap();
+        let k_norm_w = weights
+            .get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .unwrap();
 
         let (batch, seq, _) = q.dims3()?;
         let q = q.reshape((batch, seq, num_heads, head_dim))?;
@@ -621,7 +657,9 @@ fn run_code_predictor(
         let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_out = attn_probs.matmul(&v)?;
 
-        let attn_out = attn_out.transpose(1, 2)?.reshape((batch, seq, num_heads * head_dim))?;
+        let attn_out = attn_out
+            .transpose(1, 2)?
+            .reshape((batch, seq, num_heads * head_dim))?;
         let attn_out = linear_3d(&attn_out, o_proj, None)?;
 
         hidden = (hidden + attn_out)?;
@@ -632,9 +670,15 @@ fn run_code_predictor(
             .unwrap();
         let normed = rms_norm(&hidden, post_ln_w, eps)?;
 
-        let gate_w = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)).unwrap();
-        let up_w = weights.get(&format!("{}.mlp.up_proj.weight", prefix)).unwrap();
-        let down_w = weights.get(&format!("{}.mlp.down_proj.weight", prefix)).unwrap();
+        let gate_w = weights
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
+            .unwrap();
+        let up_w = weights
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
+            .unwrap();
+        let down_w = weights
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
+            .unwrap();
 
         let gate = linear_3d(&normed, gate_w, None)?;
         let up = linear_3d(&normed, up_w, None)?;

@@ -15,37 +15,37 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct TtsTokenIds {
     // Text special tokens (from Qwen tokenizer)
-    pub im_start: u32,      // 151644
-    pub im_end: u32,        // 151645
-    pub assistant: u32,     // 77091
-    pub newline: u32,       // 198 (\n)
-    pub tts_bos: u32,       // 151672
-    pub tts_eos: u32,       // 151673
-    pub tts_pad: u32,       // 151671
+    pub im_start: u32,  // 151644
+    pub im_end: u32,    // 151645
+    pub assistant: u32, // 77091
+    pub newline: u32,   // 198 (\n)
+    pub tts_bos: u32,   // 151672
+    pub tts_eos: u32,   // 151673
+    pub tts_pad: u32,   // 151671
 
     // Codec special tokens
-    pub codec_pad: u32,     // 2148
-    pub codec_bos: u32,     // 2149
-    pub codec_eos: u32,     // 2150
-    pub codec_think: u32,   // 2154
-    pub codec_nothink: u32, // 2155
+    pub codec_pad: u32,       // 2148
+    pub codec_bos: u32,       // 2149
+    pub codec_eos: u32,       // 2150
+    pub codec_think: u32,     // 2154
+    pub codec_nothink: u32,   // 2155
     pub codec_think_bos: u32, // 2156
     pub codec_think_eos: u32, // 2157
 
     // Language IDs (in codec embedding space)
-    pub lang_english: u32,  // 2050
-    pub lang_chinese: u32,  // 2055
+    pub lang_english: u32, // 2050
+    pub lang_chinese: u32, // 2055
 
     // Preset speakers (CustomVoice model)
-    pub spk_vivian: u32,    // 3065
-    pub spk_serena: u32,    // 3066
-    pub spk_ryan: u32,      // 3061
-    pub spk_aiden: u32,     // 2861
-    pub spk_uncle_fu: u32,  // 3010
-    pub spk_dylan: u32,     // 2878
-    pub spk_eric: u32,      // 2875
-    pub spk_ono_anna: u32,  // 2873
-    pub spk_sohee: u32,     // 2864
+    pub spk_vivian: u32,   // 3065
+    pub spk_serena: u32,   // 3066
+    pub spk_ryan: u32,     // 3061
+    pub spk_aiden: u32,    // 2861
+    pub spk_uncle_fu: u32, // 3010
+    pub spk_dylan: u32,    // 2878
+    pub spk_eric: u32,     // 2875
+    pub spk_ono_anna: u32, // 2873
+    pub spk_sohee: u32,    // 2864
 }
 
 impl Default for TtsTokenIds {
@@ -232,17 +232,18 @@ pub fn build_prefill_embeddings(
 }
 
 /// Text projection MLP: fc1 -> silu -> fc2
-fn text_projection_forward(
-    x: &Tensor,
-    weights: &HashMap<String, Tensor>,
-) -> Result<Tensor> {
-    let fc1_w = weights.get("talker.text_projection.linear_fc1.weight")
+fn text_projection_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Result<Tensor> {
+    let fc1_w = weights
+        .get("talker.text_projection.linear_fc1.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing text_projection fc1 weight"))?;
-    let fc1_b = weights.get("talker.text_projection.linear_fc1.bias")
+    let fc1_b = weights
+        .get("talker.text_projection.linear_fc1.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing text_projection fc1 bias"))?;
-    let fc2_w = weights.get("talker.text_projection.linear_fc2.weight")
+    let fc2_w = weights
+        .get("talker.text_projection.linear_fc2.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing text_projection fc2 weight"))?;
-    let fc2_b = weights.get("talker.text_projection.linear_fc2.bias")
+    let fc2_b = weights
+        .get("talker.text_projection.linear_fc2.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing text_projection fc2 bias"))?;
 
     let hidden = linear_3d(x, fc1_w, Some(fc1_b))?;
@@ -285,7 +286,11 @@ pub fn apply_token_suppression(
         }
     }
 
-    Ok(Tensor::from_vec(suppressed, logits.shape(), logits.device())?)
+    Ok(Tensor::from_vec(
+        suppressed,
+        logits.shape(),
+        logits.device(),
+    )?)
 }
 
 /// Sum embeddings from all 16 codebooks (residual VQ pattern)

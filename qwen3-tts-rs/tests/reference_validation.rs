@@ -1414,7 +1414,8 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
         .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
         .unwrap();
     let first_cluster_usage_clamped = first_cluster_usage.clamp(epsilon, f32::MAX)?;
-    let first_codebook = first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
+    let first_codebook =
+        first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
 
     // Look up embeddings and sum
     let mut embeddings = Vec::new();
@@ -2211,10 +2212,7 @@ fn test_full_decoder_12hz() -> Result<()> {
     use qwen3_tts::models::codec::{Decoder12Hz, Decoder12HzConfig};
 
     // Check if reference exists
-    if !Path::new(REFERENCE_DIR)
-        .join("decoder_output.bin")
-        .exists()
-    {
+    if !Path::new(REFERENCE_DIR).join("decoder_output.bin").exists() {
         eprintln!(
             "Decoder output reference not found. Run: python3 tools/export_decoder_reference.py"
         );
@@ -2332,7 +2330,10 @@ fn test_decoder_with_sentence_codes() -> Result<()> {
     let max_semantic = *semantic_tokens.iter().max().unwrap();
     let over_2047: usize = semantic_tokens.iter().filter(|&&x| x >= 2048).count();
 
-    println!("  Semantic tokens: min={}, max={}", min_semantic, max_semantic);
+    println!(
+        "  Semantic tokens: min={}, max={}",
+        min_semantic, max_semantic
+    );
     println!(
         "  Tokens >= 2048: {} out of {}",
         over_2047,
@@ -2357,7 +2358,9 @@ fn test_decoder_with_sentence_codes() -> Result<()> {
     assert!(
         actual_samples >= min_expected && actual_samples <= max_expected,
         "Expected samples in range [{}, {}] for 50 frames, got {}",
-        min_expected, max_expected, actual_samples
+        min_expected,
+        max_expected,
+        actual_samples
     );
 
     let audio_flat: Vec<f32> = audio.flatten_all()?.to_vec1()?;
@@ -2367,7 +2370,10 @@ fn test_decoder_with_sentence_codes() -> Result<()> {
     // Audio should be in valid range
     let audio_min = audio_flat.iter().cloned().fold(f32::INFINITY, f32::min);
     let audio_max = audio_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(audio_min >= -1.0 && audio_max <= 1.0, "Audio should be in [-1, 1]");
+    assert!(
+        audio_min >= -1.0 && audio_max <= 1.0,
+        "Audio should be in [-1, 1]"
+    );
     println!("  Audio range: [{:.6}, {:.6}]", audio_min, audio_max);
 
     println!("  DECODER WITH SENTENCE CODES PASS!");
@@ -2383,7 +2389,9 @@ fn test_e2e_pipeline() -> Result<()> {
     // Check if end-to-end reference values exist
     let e2e_audio_path = Path::new(REFERENCE_DIR).join("e2e_audio.bin");
     if !e2e_audio_path.exists() {
-        eprintln!("End-to-end reference values not found. Run: python3 tools/export_e2e_reference.py");
+        eprintln!(
+            "End-to-end reference values not found. Run: python3 tools/export_e2e_reference.py"
+        );
         return Ok(());
     }
 
@@ -2426,13 +2434,22 @@ fn test_e2e_pipeline() -> Result<()> {
     // ===== Step 1: Text Embedding & Projection =====
     println!("\n--- Step 1: Text Embedding & Projection ---");
     let text_embed_w = weights.get("talker.model.text_embedding.weight").unwrap();
-    let text_embeddings = text_embed_w.index_select(&input_ids.flatten_all()?, 0)?
+    let text_embeddings = text_embed_w
+        .index_select(&input_ids.flatten_all()?, 0)?
         .reshape((batch_size, seq_len, 2048))?;
 
-    let fc1_w = weights.get("talker.text_projection.linear_fc1.weight").unwrap();
-    let fc1_b = weights.get("talker.text_projection.linear_fc1.bias").unwrap();
-    let fc2_w = weights.get("talker.text_projection.linear_fc2.weight").unwrap();
-    let fc2_b = weights.get("talker.text_projection.linear_fc2.bias").unwrap();
+    let fc1_w = weights
+        .get("talker.text_projection.linear_fc1.weight")
+        .unwrap();
+    let fc1_b = weights
+        .get("talker.text_projection.linear_fc1.bias")
+        .unwrap();
+    let fc2_w = weights
+        .get("talker.text_projection.linear_fc2.weight")
+        .unwrap();
+    let fc2_b = weights
+        .get("talker.text_projection.linear_fc2.bias")
+        .unwrap();
 
     let hidden = linear(&text_embeddings, fc1_w, Some(fc1_b))?;
     let hidden = candle_nn::ops::silu(&hidden)?;
@@ -2466,14 +2483,44 @@ fn test_e2e_pipeline() -> Result<()> {
     let causal_mask = Tensor::from_vec(causal_data, (seq_len, seq_len), &device)?;
 
     for layer_idx in 0..num_layers {
-        let input_ln_w = weights.get(&format!("talker.model.layers.{}.input_layernorm.weight", layer_idx)).unwrap();
+        let input_ln_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.input_layernorm.weight",
+                layer_idx
+            ))
+            .unwrap();
         let normed = rms_norm(&hidden, input_ln_w, eps)?;
 
-        let q_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.q_proj.weight", layer_idx)).unwrap();
-        let k_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.k_proj.weight", layer_idx)).unwrap();
-        let v_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.v_proj.weight", layer_idx)).unwrap();
-        let q_norm_w = weights.get(&format!("talker.model.layers.{}.self_attn.q_norm.weight", layer_idx)).unwrap();
-        let k_norm_w = weights.get(&format!("talker.model.layers.{}.self_attn.k_norm.weight", layer_idx)).unwrap();
+        let q_proj_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.q_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let k_proj_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.k_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let v_proj_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.v_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let q_norm_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.q_norm.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let k_norm_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.k_norm.weight",
+                layer_idx
+            ))
+            .unwrap();
 
         let mut q = linear(&normed, q_proj_w, None)?;
         q = q.reshape((batch_size, seq_len, num_heads, head_dim))?;
@@ -2490,8 +2537,12 @@ fn test_e2e_pipeline() -> Result<()> {
             .transpose(1, 2)?;
 
         // RoPE
-        let q = q.broadcast_mul(&cos)?.broadcast_add(&rotate_half(&q)?.broadcast_mul(&sin)?)?;
-        let k = k.broadcast_mul(&cos)?.broadcast_add(&rotate_half(&k)?.broadcast_mul(&sin)?)?;
+        let q = q
+            .broadcast_mul(&cos)?
+            .broadcast_add(&rotate_half(&q)?.broadcast_mul(&sin)?)?;
+        let k = k
+            .broadcast_mul(&cos)?
+            .broadcast_add(&rotate_half(&k)?.broadcast_mul(&sin)?)?;
 
         // Repeat KV
         let k_exp = repeat_kv(&k, n_rep)?;
@@ -2504,19 +2555,46 @@ fn test_e2e_pipeline() -> Result<()> {
         let attn_output = attn_probs.matmul(&v_exp)?;
 
         // O projection
-        let o_proj_w = weights.get(&format!("talker.model.layers.{}.self_attn.o_proj.weight", layer_idx)).unwrap();
-        let attn_output_flat = attn_output.transpose(1, 2)?
-            .reshape((batch_size, seq_len, num_heads * head_dim))?;
+        let o_proj_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.self_attn.o_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let attn_output_flat =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((batch_size, seq_len, num_heads * head_dim))?;
         let attn_proj = linear(&attn_output_flat, o_proj_w, None)?;
         hidden = (hidden + attn_proj)?;
 
         // MLP
-        let post_ln_w = weights.get(&format!("talker.model.layers.{}.post_attention_layernorm.weight", layer_idx)).unwrap();
+        let post_ln_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.post_attention_layernorm.weight",
+                layer_idx
+            ))
+            .unwrap();
         let mlp_input = rms_norm(&hidden, post_ln_w, eps)?;
 
-        let gate_w = weights.get(&format!("talker.model.layers.{}.mlp.gate_proj.weight", layer_idx)).unwrap();
-        let up_w = weights.get(&format!("talker.model.layers.{}.mlp.up_proj.weight", layer_idx)).unwrap();
-        let down_w = weights.get(&format!("talker.model.layers.{}.mlp.down_proj.weight", layer_idx)).unwrap();
+        let gate_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.mlp.gate_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let up_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.mlp.up_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
+        let down_w = weights
+            .get(&format!(
+                "talker.model.layers.{}.mlp.down_proj.weight",
+                layer_idx
+            ))
+            .unwrap();
 
         let gate = linear(&mlp_input, gate_w, None)?;
         let up = linear(&mlp_input, up_w, None)?;
@@ -2542,8 +2620,10 @@ fn test_e2e_pipeline() -> Result<()> {
     let last_semantic: u32 = semantic_tokens.i((0, seq_len - 1))?.to_scalar()?;
 
     let codec_embed_w = weights.get("talker.model.codec_embedding.weight").unwrap();
-    let semantic_embed = codec_embed_w.i(last_semantic as usize)?
-        .unsqueeze(0)?.unsqueeze(0)?;
+    let semantic_embed = codec_embed_w
+        .i(last_semantic as usize)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
 
     let cp_input = Tensor::cat(&[&last_hidden, &semantic_embed], 1)?;
     let cp_seq_len = cp_input.dim(1)?;
@@ -2551,7 +2631,9 @@ fn test_e2e_pipeline() -> Result<()> {
     // Build RoPE for code predictor
     let cp_positions = Tensor::arange(0u32, cp_seq_len as u32, &device)?;
     let cp_positions_f = cp_positions.to_dtype(DType::F32)?;
-    let cp_freqs = cp_positions_f.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+    let cp_freqs = cp_positions_f
+        .unsqueeze(1)?
+        .matmul(&inv_freq.unsqueeze(0)?)?;
     let cp_cos = cp_freqs.cos()?.repeat((1, 2))?.unsqueeze(0)?.unsqueeze(0)?;
     let cp_sin = cp_freqs.sin()?.repeat((1, 2))?.unsqueeze(0)?.unsqueeze(0)?;
 
@@ -2568,14 +2650,26 @@ fn test_e2e_pipeline() -> Result<()> {
     for layer_idx in 0..5 {
         let prefix = format!("talker.code_predictor.model.layers.{}", layer_idx);
 
-        let input_ln_w = weights.get(&format!("{}.input_layernorm.weight", prefix)).unwrap();
+        let input_ln_w = weights
+            .get(&format!("{}.input_layernorm.weight", prefix))
+            .unwrap();
         let normed = rms_norm(&cp_hidden, input_ln_w, eps)?;
 
-        let q_proj_w = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)).unwrap();
-        let k_proj_w = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)).unwrap();
-        let v_proj_w = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)).unwrap();
-        let q_norm_w = weights.get(&format!("{}.self_attn.q_norm.weight", prefix)).unwrap();
-        let k_norm_w = weights.get(&format!("{}.self_attn.k_norm.weight", prefix)).unwrap();
+        let q_proj_w = weights
+            .get(&format!("{}.self_attn.q_proj.weight", prefix))
+            .unwrap();
+        let k_proj_w = weights
+            .get(&format!("{}.self_attn.k_proj.weight", prefix))
+            .unwrap();
+        let v_proj_w = weights
+            .get(&format!("{}.self_attn.v_proj.weight", prefix))
+            .unwrap();
+        let q_norm_w = weights
+            .get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .unwrap();
+        let k_norm_w = weights
+            .get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .unwrap();
 
         let mut q = linear(&normed, q_proj_w, None)?;
         q = q.reshape((1, cp_seq_len, num_heads, head_dim))?;
@@ -2592,8 +2686,12 @@ fn test_e2e_pipeline() -> Result<()> {
             .transpose(1, 2)?;
 
         // RoPE
-        let q = q.broadcast_mul(&cp_cos)?.broadcast_add(&rotate_half(&q)?.broadcast_mul(&cp_sin)?)?;
-        let k = k.broadcast_mul(&cp_cos)?.broadcast_add(&rotate_half(&k)?.broadcast_mul(&cp_sin)?)?;
+        let q = q
+            .broadcast_mul(&cp_cos)?
+            .broadcast_add(&rotate_half(&q)?.broadcast_mul(&cp_sin)?)?;
+        let k = k
+            .broadcast_mul(&cp_cos)?
+            .broadcast_add(&rotate_half(&k)?.broadcast_mul(&cp_sin)?)?;
 
         // Repeat KV
         let k_exp = repeat_kv(&k, n_rep)?;
@@ -2606,19 +2704,31 @@ fn test_e2e_pipeline() -> Result<()> {
         let attn_output = attn_probs.matmul(&v_exp)?;
 
         // O projection
-        let o_proj_w = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)).unwrap();
-        let attn_output_flat = attn_output.transpose(1, 2)?
-            .reshape((1, cp_seq_len, num_heads * head_dim))?;
+        let o_proj_w = weights
+            .get(&format!("{}.self_attn.o_proj.weight", prefix))
+            .unwrap();
+        let attn_output_flat =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((1, cp_seq_len, num_heads * head_dim))?;
         let attn_proj = linear(&attn_output_flat, o_proj_w, None)?;
         cp_hidden = (cp_hidden + attn_proj)?;
 
         // MLP
-        let post_ln_w = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)).unwrap();
+        let post_ln_w = weights
+            .get(&format!("{}.post_attention_layernorm.weight", prefix))
+            .unwrap();
         let mlp_input = rms_norm(&cp_hidden, post_ln_w, eps)?;
 
-        let gate_w = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)).unwrap();
-        let up_w = weights.get(&format!("{}.mlp.up_proj.weight", prefix)).unwrap();
-        let down_w = weights.get(&format!("{}.mlp.down_proj.weight", prefix)).unwrap();
+        let gate_w = weights
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
+            .unwrap();
+        let up_w = weights
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
+            .unwrap();
+        let down_w = weights
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
+            .unwrap();
 
         let gate = linear(&mlp_input, gate_w, None)?;
         let up = linear(&mlp_input, up_w, None)?;
@@ -2628,13 +2738,17 @@ fn test_e2e_pipeline() -> Result<()> {
     }
 
     // Final norm
-    let cp_norm_w = weights.get("talker.code_predictor.model.norm.weight").unwrap();
+    let cp_norm_w = weights
+        .get("talker.code_predictor.model.norm.weight")
+        .unwrap();
     let cp_hidden = rms_norm(&cp_hidden, cp_norm_w, eps)?;
 
     // Generate acoustic tokens
     let mut acoustic_tokens = Vec::with_capacity(15);
     for i in 0..15 {
-        let lm_head_w = weights.get(&format!("talker.code_predictor.lm_head.{}.weight", i)).unwrap();
+        let lm_head_w = weights
+            .get(&format!("talker.code_predictor.lm_head.{}.weight", i))
+            .unwrap();
         let logits = linear(&cp_hidden.i((.., 1..2, ..))?, lm_head_w, None)?;
         let token: u32 = logits.argmax(2)?.squeeze(0)?.squeeze(0)?.to_scalar()?;
         acoustic_tokens.push(token);
@@ -2706,7 +2820,10 @@ fn test_talker_model_forward() -> Result<()> {
 
     // Create talker model
     let talker = TalkerModel::from_weights(&weights, &device)?;
-    println!("  TalkerModel created with {} layers", talker.config().num_hidden_layers);
+    println!(
+        "  TalkerModel created with {} layers",
+        talker.config().num_hidden_layers
+    );
 
     // Input: "Hello, this is a" = [9707, 11, 419, 374, 264]
     let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?.unsqueeze(0)?;
@@ -2819,7 +2936,12 @@ fn test_talker_model_text_embedding() -> Result<()> {
 
     compare_tensors("text_embeddings", &rust_embeddings, &python_embeddings)?;
 
-    assert!(tensors_close(&rust_embeddings, &python_embeddings, 1e-5, 1e-6)?);
+    assert!(tensors_close(
+        &rust_embeddings,
+        &python_embeddings,
+        1e-5,
+        1e-6
+    )?);
     println!("  TEXT EMBEDDING PASS!");
 
     Ok(())
@@ -2851,9 +2973,13 @@ fn test_talker_model_construction() -> Result<()> {
     assert_eq!(config.num_key_value_heads, 8);
     assert_eq!(config.head_dim, 128);
 
-    println!("  Config: {} layers, {} heads, {} kv_heads, {} head_dim",
-             config.num_hidden_layers, config.num_attention_heads,
-             config.num_key_value_heads, config.head_dim);
+    println!(
+        "  Config: {} layers, {} heads, {} kv_heads, {} head_dim",
+        config.num_hidden_layers,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.head_dim
+    );
 
     println!("  TALKER MODEL CONSTRUCTION PASS!");
 
@@ -2864,12 +2990,12 @@ fn test_talker_model_construction() -> Result<()> {
 fn test_autoregressive_generation() -> Result<()> {
     // Test the full autoregressive pipeline:
     // Text → TalkerModel → CodePredictor → Decoder → Audio
-    use qwen3_tts::models::talker::TalkerModel;
+    use candle_nn::VarBuilder;
+    use qwen3_tts::generation::{sample, GenerationConfig};
     use qwen3_tts::models::code_predictor::{CodePredictor, CodePredictorConfig};
     use qwen3_tts::models::codec::Decoder12Hz;
+    use qwen3_tts::models::talker::TalkerModel;
     use qwen3_tts::models::KVCache;
-    use qwen3_tts::generation::{GenerationConfig, sample};
-    use candle_nn::VarBuilder;
 
     if !reference_available() {
         eprintln!("Reference values not found. Run: python3 tools/export_reference_values.py");
@@ -2908,7 +3034,10 @@ fn test_autoregressive_generation() -> Result<()> {
 
     // Create TalkerModel
     let talker = TalkerModel::from_weights(&weights, &device)?;
-    println!("  TalkerModel created with {} layers", talker.config().num_hidden_layers);
+    println!(
+        "  TalkerModel created with {} layers",
+        talker.config().num_hidden_layers
+    );
 
     // Create CodePredictor
     let cp_config = CodePredictorConfig::default();
@@ -2917,7 +3046,12 @@ fn test_autoregressive_generation() -> Result<()> {
         .iter()
         .filter_map(|(k, v)| {
             if k.starts_with("talker.code_predictor.") {
-                Some((k.strip_prefix("talker.code_predictor.").unwrap().to_string(), v.clone()))
+                Some((
+                    k.strip_prefix("talker.code_predictor.")
+                        .unwrap()
+                        .to_string(),
+                    v.clone(),
+                ))
             } else {
                 None
             }
@@ -2941,7 +3075,11 @@ fn test_autoregressive_generation() -> Result<()> {
     // Prefill talker with text
     let (hidden, logits) = talker.prefill(&input_ids, &mut talker_kv_caches)?;
     let mut offset = input_ids.dim(1)?;
-    println!("  After prefill: hidden {:?}, logits {:?}", hidden.dims(), logits.dims());
+    println!(
+        "  After prefill: hidden {:?}, logits {:?}",
+        hidden.dims(),
+        logits.dims()
+    );
 
     // Get hidden state for last position (input to code predictor)
     let seq_len = hidden.dim(1)?;
@@ -2968,7 +3106,11 @@ fn test_autoregressive_generation() -> Result<()> {
     // First frame
     let semantic_embed = talker.get_codec_embedding(first_token_id)?;
     let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-    println!("  Frame 0: semantic={}, acoustics={:?}", first_token_id, &acoustic_codes[..3]);
+    println!(
+        "  Frame 0: semantic={}, acoustics={:?}",
+        first_token_id,
+        &acoustic_codes[..3]
+    );
     let mut frame_codes = vec![first_token_id];
     frame_codes.extend(acoustic_codes);
     all_codes.push(frame_codes);
@@ -2986,8 +3128,14 @@ fn test_autoregressive_generation() -> Result<()> {
 
         // Generate acoustic tokens
         let semantic_embed = talker.get_codec_embedding(next_token_id)?;
-        let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-        println!("  Frame {}: semantic={}, acoustics={:?}", frame_idx, next_token_id, &acoustic_codes[..3]);
+        let acoustic_codes =
+            code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        println!(
+            "  Frame {}: semantic={}, acoustics={:?}",
+            frame_idx,
+            next_token_id,
+            &acoustic_codes[..3]
+        );
         let mut frame_codes = vec![next_token_id];
         frame_codes.extend(acoustic_codes);
         all_codes.push(frame_codes);
@@ -3011,10 +3159,7 @@ fn test_autoregressive_generation() -> Result<()> {
     // Verify audio is non-zero
     let audio_abs_mean: f32 = audio.abs()?.mean_all()?.to_scalar()?;
     println!("  Audio abs mean: {:.6}", audio_abs_mean);
-    assert!(
-        audio_abs_mean > 1e-6,
-        "Audio should not be all zeros"
-    );
+    assert!(audio_abs_mean > 1e-6, "Audio should not be all zeros");
 
     // Verify audio length is reasonable (5 frames at 12.5Hz ≈ 0.4s ≈ 9000+ samples at 24kHz)
     // With proper causal trimming, output is slightly shorter than num_frames * 1920
@@ -3025,7 +3170,9 @@ fn test_autoregressive_generation() -> Result<()> {
     assert!(
         actual_samples >= min_expected && actual_samples <= max_expected,
         "Expected samples in range [{}, {}], got {}",
-        min_expected, max_expected, actual_samples
+        min_expected,
+        max_expected,
+        actual_samples
     );
 
     println!("  AUTOREGRESSIVE GENERATION PASS!");

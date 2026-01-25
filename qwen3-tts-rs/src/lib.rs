@@ -42,9 +42,9 @@ use models::KVCache;
 /// Re-exports for convenience
 pub use audio::AudioBuffer;
 pub use models::config::Qwen3TTSConfig;
+pub use models::talker::{codec_tokens, special_tokens, tts_tokens, Language, Speaker};
 pub use models::Qwen3TTSModel;
 pub use models::{CodePredictor, CodePredictorConfig, TalkerConfig, TalkerModel as Talker};
-pub use models::talker::{Language, Speaker, codec_tokens, special_tokens, tts_tokens};
 
 /// Main TTS interface using proper autoregressive pipeline
 pub struct Qwen3TTS {
@@ -217,7 +217,9 @@ impl Qwen3TTS {
 
         // Generate first frame's acoustic tokens
         let semantic_embed = self.talker.get_codec_embedding(first_token_id)?;
-        let acoustic_codes = self.code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        let acoustic_codes = self
+            .code_predictor
+            .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
         let mut frame_codes = vec![first_token_id];
         frame_codes.extend(acoustic_codes);
         all_codes.push(frame_codes);
@@ -226,7 +228,9 @@ impl Qwen3TTS {
         for _ in 1..config.max_new_tokens {
             // Generate next semantic token
             let prev_token = all_codes.last().unwrap()[0];
-            let (hidden, logits) = self.talker.generate_step(prev_token, &mut talker_kv_caches, offset)?;
+            let (hidden, logits) =
+                self.talker
+                    .generate_step(prev_token, &mut talker_kv_caches, offset)?;
             offset += 1;
             last_hidden = hidden;
 
@@ -243,7 +247,9 @@ impl Qwen3TTS {
 
             // Generate acoustic tokens for this frame
             let semantic_embed = self.talker.get_codec_embedding(next_token_id)?;
-            let acoustic_codes = self.code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+            let acoustic_codes = self
+                .code_predictor
+                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
             let mut frame_codes = vec![next_token_id];
             frame_codes.extend(acoustic_codes);
             all_codes.push(frame_codes);

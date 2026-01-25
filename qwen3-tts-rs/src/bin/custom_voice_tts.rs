@@ -11,7 +11,10 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::Path;
 
-use qwen3_tts::{generation, models, AudioBuffer, CodePredictorConfig, Language, Speaker, TalkerConfig};
+use qwen3_tts::{
+    generation, models, tokenizer, AudioBuffer, CodePredictorConfig, Language, Speaker,
+    TalkerConfig,
+};
 
 /// Generate TTS audio with CustomVoice model
 #[derive(Parser, Debug)]
@@ -49,6 +52,10 @@ struct Args {
     #[arg(short, long, default_value = "../test_data/model_customvoice")]
     model_dir: String,
 
+    /// Tokenizer directory (defaults to model_dir/../tokenizer)
+    #[arg(long)]
+    tokenizer_dir: Option<String>,
+
     /// Output WAV file
     #[arg(short, long, default_value = "output.wav")]
     output: String,
@@ -84,21 +91,6 @@ fn parse_language(name: &str) -> Result<Language> {
         "spanish" | "es" => Ok(Language::Spanish),
         "italian" | "it" => Ok(Language::Italian),
         _ => anyhow::bail!("Unknown language: {}. Options: english, chinese, japanese, korean, german, french, russian, portuguese, spanish, italian", name),
-    }
-}
-
-/// Simple text to token mapping
-fn text_to_ids(text: &str) -> Vec<u32> {
-    match text {
-        "Hello" => vec![9707],
-        "Hello world" => vec![9707, 1879],
-        "Hello, this is a test" => vec![9707, 11, 419, 374, 264, 1273],
-        "Good morning" => vec![15571, 6017],
-        "How are you?" => vec![4340, 525, 498, 30],
-        _ => {
-            eprintln!("Warning: Text '{}' not in tokenizer mapping, using 'Hello'", text);
-            vec![9707]
-        }
     }
 }
 
@@ -142,7 +134,8 @@ fn main() -> Result<()> {
 
     // Load decoder
     let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
-    let decoder_weights: HashMap<String, Tensor> = candle_core::safetensors::load(&decoder_path, &device)?;
+    let decoder_weights: HashMap<String, Tensor> =
+        candle_core::safetensors::load(&decoder_path, &device)?;
     let decoder_weights: HashMap<String, Tensor> = decoder_weights
         .into_iter()
         .map(|(name, tensor)| {
@@ -166,7 +159,12 @@ fn main() -> Result<()> {
         .iter()
         .filter_map(|(k, v)| {
             if k.starts_with("talker.code_predictor.") {
-                Some((k.strip_prefix("talker.code_predictor.").unwrap().to_string(), v.clone()))
+                Some((
+                    k.strip_prefix("talker.code_predictor.")
+                        .unwrap()
+                        .to_string(),
+                    v.clone(),
+                ))
             } else {
                 None
             }
@@ -178,8 +176,21 @@ fn main() -> Result<()> {
     println!("Creating Decoder12Hz...");
     let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
 
-    // Get text tokens
-    let text_tokens = text_to_ids(&args.text);
+    // Load tokenizer
+    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| {
+        // Default: model_dir/../tokenizer
+        Path::new(&args.model_dir)
+            .parent()
+            .map(|p| p.join("tokenizer"))
+            .unwrap_or_else(|| Path::new("tokenizer").to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    });
+    println!("Loading tokenizer from {}...", tokenizer_dir);
+    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+
+    // Tokenize text
+    let text_tokens = text_tokenizer.encode(&args.text)?;
     println!("\nText tokens: {:?}", text_tokens);
 
     // Generation config
@@ -228,7 +239,8 @@ fn main() -> Result<()> {
     println!("Trailing text hidden shape: [{}, {}]", 1, trailing_len);
 
     let mut kv_caches = talker.new_kv_caches();
-    let (hidden, logits) = talker.prefill_custom_voice(&text_tokens, speaker, language, &mut kv_caches)?;
+    let (hidden, logits) =
+        talker.prefill_custom_voice(&text_tokens, speaker, language, &mut kv_caches)?;
 
     // Calculate offset - prefill creates:
     // 3 role prefix + 6 codec positions + 1 first text = 10 positions
@@ -265,7 +277,8 @@ fn main() -> Result<()> {
         let semantic_embed = talker.get_codec_embedding(prev_semantic)?;
 
         // Generate acoustic codes from [past_hidden, semantic_embed]
-        let acoustic_codes = code_predictor.generate_acoustic_codes(&past_hidden, &semantic_embed)?;
+        let acoustic_codes =
+            code_predictor.generate_acoustic_codes(&past_hidden, &semantic_embed)?;
 
         // Save this frame's codes
         let mut frame_codes = vec![prev_semantic];
@@ -273,7 +286,12 @@ fn main() -> Result<()> {
         all_codes.push(frame_codes.clone());
 
         if frame_idx < 5 || frame_idx == args.frames - 1 {
-            println!("Frame {}: semantic={}, acoustics={:?}...", frame_idx, prev_semantic, &acoustic_codes[..3]);
+            println!(
+                "Frame {}: semantic={}, acoustics={:?}...",
+                frame_idx,
+                prev_semantic,
+                &acoustic_codes[..3]
+            );
         } else if frame_idx == 5 {
             println!("...");
         }
@@ -296,7 +314,8 @@ fn main() -> Result<()> {
         input_embed = input_embed.add(&text_to_add)?;
 
         // Forward through talker
-        let (hidden, logits) = talker.generate_step_with_embed(&input_embed, &mut kv_caches, offset)?;
+        let (hidden, logits) =
+            talker.generate_step_with_embed(&input_embed, &mut kv_caches, offset)?;
         offset += 1;
         past_hidden = hidden;
 
@@ -330,10 +349,21 @@ fn main() -> Result<()> {
     let waveform = decoder.decode(&codes_tensor)?;
     let audio_samples: Vec<f32> = waveform.flatten_all()?.to_vec1()?;
     let min_val = audio_samples.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_val = audio_samples.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let rms: f32 = (audio_samples.iter().map(|x| x * x).sum::<f32>() / audio_samples.len() as f32).sqrt();
-    println!("Audio samples: {} ({:.2}s at 24kHz)", audio_samples.len(), audio_samples.len() as f64 / 24000.0);
-    println!("Audio range: [{:.6}, {:.6}], RMS: {:.6}", min_val, max_val, rms);
+    let max_val = audio_samples
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let rms: f32 =
+        (audio_samples.iter().map(|x| x * x).sum::<f32>() / audio_samples.len() as f32).sqrt();
+    println!(
+        "Audio samples: {} ({:.2}s at 24kHz)",
+        audio_samples.len(),
+        audio_samples.len() as f64 / 24000.0
+    );
+    println!(
+        "Audio range: [{:.6}, {:.6}], RMS: {:.6}",
+        min_val, max_val, rms
+    );
 
     // Save WAV
     let audio_buffer = AudioBuffer::new(audio_samples, 24000);

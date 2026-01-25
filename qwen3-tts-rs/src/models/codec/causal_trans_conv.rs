@@ -185,10 +185,10 @@ mod tests {
         // (kernel, stride) -> expected output for input_len=4
         // Official formula: output = (input - 1) * stride when kernel = 2 * stride
         let test_cases = [
-            (16, 8, 24),  // (4-1)*8 = 24
-            (10, 5, 15),  // (4-1)*5 = 15
-            (8, 4, 12),   // (4-1)*4 = 12
-            (6, 3, 9),    // (4-1)*3 = 9
+            (16, 8, 24), // (4-1)*8 = 24
+            (10, 5, 15), // (4-1)*5 = 15
+            (8, 4, 12),  // (4-1)*4 = 12
+            (6, 3, 9),   // (4-1)*3 = 9
         ];
 
         for (kernel_size, stride, expected_len) in test_cases {

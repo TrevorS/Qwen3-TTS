@@ -103,7 +103,10 @@ impl UpsampleStage {
             convnext_gamma,
         )?;
 
-        Ok(Self { trans_conv, convnext })
+        Ok(Self {
+            trans_conv,
+            convnext,
+        })
     }
 
     /// Forward pass
@@ -170,7 +173,10 @@ struct TransformerWeights {
 
 impl Decoder12Hz {
     /// Load decoder from safetensors weights
-    pub fn from_weights(weights: &HashMap<String, Tensor>, config: Decoder12HzConfig) -> Result<Self> {
+    pub fn from_weights(
+        weights: &HashMap<String, Tensor>,
+        config: Decoder12HzConfig,
+    ) -> Result<Self> {
         let _device = weights
             .values()
             .next()
@@ -191,8 +197,8 @@ impl Decoder12Hz {
         // Per official implementation, clamp cluster_usage to avoid divide-by-zero
         let epsilon = 1e-7f32;
         let first_cluster_usage_clamped = first_cluster_usage.clamp(epsilon, f32::MAX)?;
-        let first_codebook = first_embedding_sum
-            .broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
+        let first_codebook =
+            first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
 
         let mut rest_codebooks = Vec::with_capacity(15);
         for i in 0..15 {
@@ -389,16 +395,49 @@ impl Decoder12Hz {
 
             // Helper to load residual unit weights
             #[allow(clippy::type_complexity)]
-            let load_res = |unit_idx: usize| -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+            let load_res = |unit_idx: usize| -> Result<(
+                Tensor,
+                Tensor,
+                Tensor,
+                Tensor,
+                Tensor,
+                Tensor,
+                Tensor,
+                Tensor,
+            )> {
                 Ok((
-                    weights.get(&format!("{}.{}.act1.alpha", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.act1.beta", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.conv1.conv.weight", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.conv1.conv.bias", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.act2.alpha", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.act2.beta", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.conv2.conv.weight", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                    weights.get(&format!("{}.{}.conv2.conv.bias", prefix, unit_idx)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
+                    weights
+                        .get(&format!("{}.{}.act1.alpha", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.act1.beta", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.conv1.conv.weight", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.conv1.conv.bias", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.act2.alpha", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.act2.beta", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.conv2.conv.weight", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
+                    weights
+                        .get(&format!("{}.{}.conv2.conv.bias", prefix, unit_idx))
+                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                        .clone(),
                 ))
             };
 
@@ -407,13 +446,46 @@ impl Decoder12Hz {
             let (r3_a1a, r3_a1b, r3_c1w, r3_c1b, r3_a2a, r3_a2b, r3_c2w, r3_c2b) = load_res(4)?;
 
             let block = DecoderBlock::from_weights(
-                weights.get(&format!("{}.0.alpha", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                weights.get(&format!("{}.0.beta", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                weights.get(&format!("{}.1.conv.weight", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                weights.get(&format!("{}.1.conv.bias", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?.clone(),
-                r1_a1a, r1_a1b, r1_c1w, r1_c1b, r1_a2a, r1_a2b, r1_c2w, r1_c2b,
-                r2_a1a, r2_a1b, r2_c1w, r2_c1b, r2_a2a, r2_a2b, r2_c2w, r2_c2b,
-                r3_a1a, r3_a1b, r3_c1w, r3_c1b, r3_a2a, r3_a2b, r3_c2w, r3_c2b,
+                weights
+                    .get(&format!("{}.0.alpha", prefix))
+                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                    .clone(),
+                weights
+                    .get(&format!("{}.0.beta", prefix))
+                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                    .clone(),
+                weights
+                    .get(&format!("{}.1.conv.weight", prefix))
+                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                    .clone(),
+                weights
+                    .get(&format!("{}.1.conv.bias", prefix))
+                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
+                    .clone(),
+                r1_a1a,
+                r1_a1b,
+                r1_c1w,
+                r1_c1b,
+                r1_a2a,
+                r1_a2b,
+                r1_c2w,
+                r1_c2b,
+                r2_a1a,
+                r2_a1b,
+                r2_c1w,
+                r2_c1b,
+                r2_a2a,
+                r2_a2b,
+                r2_c2w,
+                r2_c2b,
+                r3_a1a,
+                r3_a1b,
+                r3_c1w,
+                r3_c1b,
+                r3_a2a,
+                r3_a2b,
+                r3_c2w,
+                r3_c2b,
                 rate,
             )?;
             decoder_blocks.push(block);
@@ -484,18 +556,17 @@ impl Decoder12Hz {
         let codebook_size = self.config.codebook_size as i64;
         // Apply modulo to map 3072 vocab → 2048 codebook
         let first_codes_vec: Vec<i64> = first_codes_flat.to_vec1()?;
-        let first_codes_mod: Vec<i64> = first_codes_vec
-            .iter()
-            .map(|&c| c % codebook_size)
-            .collect();
-        let first_codes_tensor = Tensor::from_vec(first_codes_mod, first_codes_flat.dims(), device)?;
+        let first_codes_mod: Vec<i64> =
+            first_codes_vec.iter().map(|&c| c % codebook_size).collect();
+        let first_codes_tensor =
+            Tensor::from_vec(first_codes_mod, first_codes_flat.dims(), device)?;
         let first_embed = self.first_codebook.index_select(&first_codes_tensor, 0)?;
         let first_embed = first_embed.reshape((batch_size, seq_len, 256))?;
 
         // Apply first output projection: Conv1d expects [batch, channels, seq]
         // first_embed is [batch, seq, 256], transpose to [batch, 256, seq]
         let first_embed_t = first_embed.transpose(1, 2)?; // [batch, 256, seq]
-        // first_output_proj is [512, 256, 1] - 1x1 conv
+                                                          // first_output_proj is [512, 256, 1] - 1x1 conv
         let first_proj = self.conv1d_1x1(&first_embed_t, &self.first_output_proj)?; // [batch, 512, seq]
 
         // Rest quantizers (acoustic) - 15 layers, sum embeddings then project
@@ -520,7 +591,11 @@ impl Decoder12Hz {
 
         // 3. Pre-transformer
         let hidden = hidden.transpose(1, 2)?; // [batch, seq, 1024]
-        let hidden = self.linear_3d(&hidden, &self.input_proj_weight, Some(&self.input_proj_bias))?;
+        let hidden = self.linear_3d(
+            &hidden,
+            &self.input_proj_weight,
+            Some(&self.input_proj_bias),
+        )?;
 
         // Run transformer layers
         let hidden = self.run_transformer(hidden, seq_len)?;
@@ -529,7 +604,11 @@ impl Decoder12Hz {
         let hidden = self.rms_norm(&hidden, &self.final_norm_weight)?;
 
         // Output projection
-        let hidden = self.linear_3d(&hidden, &self.output_proj_weight, Some(&self.output_proj_bias))?;
+        let hidden = self.linear_3d(
+            &hidden,
+            &self.output_proj_weight,
+            Some(&self.output_proj_bias),
+        )?;
 
         // 4. Transpose for conv: [batch, seq, 1024] -> [batch, 1024, seq]
         let mut hidden = hidden.transpose(1, 2)?;
@@ -596,7 +675,9 @@ impl Decoder12Hz {
         let positions = Tensor::arange(0u32, seq_len as u32, device)?;
         let inv_freq_vals: Vec<f32> = (0..self.config.head_dim)
             .step_by(2)
-            .map(|i| 1.0 / (self.config.rope_theta as f32).powf(i as f32 / self.config.head_dim as f32))
+            .map(|i| {
+                1.0 / (self.config.rope_theta as f32).powf(i as f32 / self.config.head_dim as f32)
+            })
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq_vals, (self.config.head_dim / 2,), device)?;
 
@@ -619,7 +700,15 @@ impl Decoder12Hz {
             .unsqueeze(0)?;
 
         for layer in &self.transformer_weights.layers {
-            hidden = self.run_layer(&hidden, layer, &cos, &sin, &causal_mask, batch_size, seq_len)?;
+            hidden = self.run_layer(
+                &hidden,
+                layer,
+                &cos,
+                &sin,
+                &causal_mask,
+                batch_size,
+                seq_len,
+            )?;
         }
 
         Ok(hidden)
@@ -646,11 +735,29 @@ impl Decoder12Hz {
         let v = self.linear_3d(&normed, &layer.v_proj_weight, None)?;
 
         // Reshape for multi-head attention
-        let q = q.reshape((batch_size, seq_len, self.config.num_heads, self.config.head_dim))?
+        let q = q
+            .reshape((
+                batch_size,
+                seq_len,
+                self.config.num_heads,
+                self.config.head_dim,
+            ))?
             .transpose(1, 2)?; // [batch, heads, seq, head_dim]
-        let k = k.reshape((batch_size, seq_len, self.config.num_heads, self.config.head_dim))?
+        let k = k
+            .reshape((
+                batch_size,
+                seq_len,
+                self.config.num_heads,
+                self.config.head_dim,
+            ))?
             .transpose(1, 2)?;
-        let v = v.reshape((batch_size, seq_len, self.config.num_heads, self.config.head_dim))?
+        let v = v
+            .reshape((
+                batch_size,
+                seq_len,
+                self.config.num_heads,
+                self.config.head_dim,
+            ))?
             .transpose(1, 2)?;
 
         // Apply RoPE
@@ -666,8 +773,11 @@ impl Decoder12Hz {
         let attn_out = attn.matmul(&v)?;
 
         // Reshape back
-        let attn_out = attn_out.transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.config.num_heads * self.config.head_dim))?;
+        let attn_out = attn_out.transpose(1, 2)?.reshape((
+            batch_size,
+            seq_len,
+            self.config.num_heads * self.config.head_dim,
+        ))?;
 
         // Output projection
         let attn_out = self.linear_3d(&attn_out, &layer.o_proj_weight, None)?;
@@ -698,7 +808,11 @@ impl Decoder12Hz {
     /// Apply rotary position embedding
     fn apply_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let x1 = x.narrow(D::Minus1, 0, self.config.head_dim / 2)?;
-        let x2 = x.narrow(D::Minus1, self.config.head_dim / 2, self.config.head_dim / 2)?;
+        let x2 = x.narrow(
+            D::Minus1,
+            self.config.head_dim / 2,
+            self.config.head_dim / 2,
+        )?;
         let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
         Ok((x.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?)?)
     }

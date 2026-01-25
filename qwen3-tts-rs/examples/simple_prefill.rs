@@ -23,15 +23,23 @@ fn main() -> anyhow::Result<()> {
 
     // Simple prefill - just "Hello" (9707) exactly like Python
     let text_embedding = weights.get("talker.model.text_embedding.weight").unwrap();
-    let fc1_w = weights.get("talker.text_projection.linear_fc1.weight").unwrap();
-    let fc1_b = weights.get("talker.text_projection.linear_fc1.bias").unwrap();
-    let fc2_w = weights.get("talker.text_projection.linear_fc2.weight").unwrap();
-    let fc2_b = weights.get("talker.text_projection.linear_fc2.bias").unwrap();
+    let fc1_w = weights
+        .get("talker.text_projection.linear_fc1.weight")
+        .unwrap();
+    let fc1_b = weights
+        .get("talker.text_projection.linear_fc1.bias")
+        .unwrap();
+    let fc2_w = weights
+        .get("talker.text_projection.linear_fc2.weight")
+        .unwrap();
+    let fc2_b = weights
+        .get("talker.text_projection.linear_fc2.bias")
+        .unwrap();
 
     // Get embedding for token 9707
     let token_id = Tensor::new(&[9707u32], &device)?;
-    let embed = text_embedding.index_select(&token_id, 0)?;  // [1, 2048]
-    let embed = embed.unsqueeze(0)?;  // [1, 1, 2048]
+    let embed = text_embedding.index_select(&token_id, 0)?; // [1, 2048]
+    let embed = embed.unsqueeze(0)?; // [1, 1, 2048]
 
     // Text projection: fc1 -> silu -> fc2
     let h = linear_3d(&embed, fc1_w, Some(fc1_b))?;
@@ -70,13 +78,33 @@ fn main() -> anyhow::Result<()> {
         let prefix = format!("talker.model.layers.{}", layer_idx);
 
         // Input LayerNorm
-        let ln_w = weights.get(&format!("{}.input_layernorm.weight", prefix)).unwrap();
+        let ln_w = weights
+            .get(&format!("{}.input_layernorm.weight", prefix))
+            .unwrap();
         let normed = rms_norm(&hidden, ln_w, eps)?;
 
         // QKV projections
-        let q = linear_3d(&normed, weights.get(&format!("{}.self_attn.q_proj.weight", prefix)).unwrap(), None)?;
-        let k = linear_3d(&normed, weights.get(&format!("{}.self_attn.k_proj.weight", prefix)).unwrap(), None)?;
-        let v = linear_3d(&normed, weights.get(&format!("{}.self_attn.v_proj.weight", prefix)).unwrap(), None)?;
+        let q = linear_3d(
+            &normed,
+            weights
+                .get(&format!("{}.self_attn.q_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
+        let k = linear_3d(
+            &normed,
+            weights
+                .get(&format!("{}.self_attn.k_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
+        let v = linear_3d(
+            &normed,
+            weights
+                .get(&format!("{}.self_attn.v_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
 
         // Reshape
         let q = q.reshape((1, seq_len, num_heads, head_dim))?;
@@ -84,8 +112,20 @@ fn main() -> anyhow::Result<()> {
         let v = v.reshape((1, seq_len, num_kv_heads, head_dim))?;
 
         // QK norm
-        let q = rms_norm(&q, weights.get(&format!("{}.self_attn.q_norm.weight", prefix)).unwrap(), eps)?;
-        let k = rms_norm(&k, weights.get(&format!("{}.self_attn.k_norm.weight", prefix)).unwrap(), eps)?;
+        let q = rms_norm(
+            &q,
+            weights
+                .get(&format!("{}.self_attn.q_norm.weight", prefix))
+                .unwrap(),
+            eps,
+        )?;
+        let k = rms_norm(
+            &k,
+            weights
+                .get(&format!("{}.self_attn.k_norm.weight", prefix))
+                .unwrap(),
+            eps,
+        )?;
 
         // Transpose to [batch, heads, seq, dim]
         let q = q.transpose(1, 2)?;
@@ -102,27 +142,57 @@ fn main() -> anyhow::Result<()> {
 
         // Attention (no mask needed for single token)
         let scale = (head_dim as f64).powf(-0.5);
-        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?.affine(scale, 0.0)?;
+        let attn = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
+            .affine(scale, 0.0)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let attn_out = attn.matmul(&v)?;
 
         // Reshape back
-        let attn_out = attn_out.transpose(1, 2)?.reshape((1, seq_len, num_heads * head_dim))?;
+        let attn_out = attn_out
+            .transpose(1, 2)?
+            .reshape((1, seq_len, num_heads * head_dim))?;
 
         // O projection
-        let attn_out = linear_3d(&attn_out, weights.get(&format!("{}.self_attn.o_proj.weight", prefix)).unwrap(), None)?;
+        let attn_out = linear_3d(
+            &attn_out,
+            weights
+                .get(&format!("{}.self_attn.o_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
 
         // Residual
         hidden = hidden.add(&attn_out)?;
 
         // MLP
-        let ln_w = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)).unwrap();
+        let ln_w = weights
+            .get(&format!("{}.post_attention_layernorm.weight", prefix))
+            .unwrap();
         let normed = rms_norm(&hidden, ln_w, eps)?;
 
-        let gate = linear_3d(&normed, weights.get(&format!("{}.mlp.gate_proj.weight", prefix)).unwrap(), None)?;
-        let up = linear_3d(&normed, weights.get(&format!("{}.mlp.up_proj.weight", prefix)).unwrap(), None)?;
+        let gate = linear_3d(
+            &normed,
+            weights
+                .get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
+        let up = linear_3d(
+            &normed,
+            weights
+                .get(&format!("{}.mlp.up_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
         let mlp_out = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        let mlp_out = linear_3d(&mlp_out, weights.get(&format!("{}.mlp.down_proj.weight", prefix)).unwrap(), None)?;
+        let mlp_out = linear_3d(
+            &mlp_out,
+            weights
+                .get(&format!("{}.mlp.down_proj.weight", prefix))
+                .unwrap(),
+            None,
+        )?;
 
         hidden = hidden.add(&mlp_out)?;
     }
@@ -131,8 +201,14 @@ fn main() -> anyhow::Result<()> {
     let norm_w = weights.get("talker.model.norm.weight").unwrap();
     hidden = rms_norm(&hidden, norm_w, eps)?;
 
-    println!("After all layers, hidden[:5]: {:?}",
-        hidden.squeeze(0)?.squeeze(0)?.narrow(0, 0, 5)?.to_vec1::<f32>()?);
+    println!(
+        "After all layers, hidden[:5]: {:?}",
+        hidden
+            .squeeze(0)?
+            .squeeze(0)?
+            .narrow(0, 0, 5)?
+            .to_vec1::<f32>()?
+    );
 
     // Get logits
     let codec_head = weights.get("talker.codec_head.weight").unwrap();
@@ -156,7 +232,11 @@ fn main() -> anyhow::Result<()> {
 
     // Show top-5 tokens
     let logits_sorted = logits.to_vec1::<f32>()?;
-    let mut indexed: Vec<(usize, f32)> = logits_sorted.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    let mut indexed: Vec<(usize, f32)> = logits_sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     println!("\nTop 5 tokens:");
     for (i, (idx, val)) in indexed.iter().take(5).enumerate() {

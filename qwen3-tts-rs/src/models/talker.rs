@@ -114,9 +114,11 @@ impl Speaker {
     /// Get the native language for this speaker
     pub fn native_language(&self) -> Language {
         match self {
-            Speaker::Serena | Speaker::Vivian | Speaker::UncleFu | Speaker::Eric | Speaker::Dylan => {
-                Language::Chinese
-            }
+            Speaker::Serena
+            | Speaker::Vivian
+            | Speaker::UncleFu
+            | Speaker::Eric
+            | Speaker::Dylan => Language::Chinese,
             Speaker::Ryan | Speaker::Aiden => Language::English,
             Speaker::OnoAnna => Language::Japanese,
             Speaker::Sohee => Language::Korean,
@@ -185,9 +187,9 @@ impl TalkerConfig {
         Self {
             text_vocab_size: 151936,
             text_embed_dim: 2048,
-            hidden_size: 2048,          // CustomVoice uses 2048
+            hidden_size: 2048, // CustomVoice uses 2048
             text_proj_intermediate: 2048,
-            intermediate_size: 6144,    // CustomVoice uses 6144
+            intermediate_size: 6144, // CustomVoice uses 6144
             num_hidden_layers: 28,
             num_attention_heads: 16,
             num_key_value_heads: 8,
@@ -456,7 +458,9 @@ impl TalkerDecoderLayer {
 
         // Scaled dot-product attention
         let scale = (self.head_dim as f64).powf(-0.5);
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?.affine(scale, 0.0)?;
+        let attn_weights = q
+            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
+            .affine(scale, 0.0)?;
 
         let attn_weights = if let Some(mask) = attention_mask {
             attn_weights.broadcast_add(mask)?
@@ -468,9 +472,11 @@ impl TalkerDecoderLayer {
         let attn_output = attn_probs.matmul(&v)?;
 
         // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         // O projection
         let attn_output = self.linear(&attn_output, &self.o_proj_weight, None)?;
@@ -757,7 +763,8 @@ impl TalkerModel {
         let mut kv_caches = self.new_kv_caches();
 
         // Prefill with CustomVoice format
-        let (_hidden, logits) = self.prefill_custom_voice(text_tokens, speaker, language, &mut kv_caches)?;
+        let (_hidden, logits) =
+            self.prefill_custom_voice(text_tokens, speaker, language, &mut kv_caches)?;
 
         // Calculate offset (text_chatml + codec_prefix + speaker + codec_bos)
         // ChatML: 3 + text_len + 5 = 8 + text_len
@@ -900,7 +907,11 @@ impl TalkerModel {
     pub fn get_projected_text_embeddings(&self, token_ids: &[u32]) -> Result<Tensor> {
         if token_ids.is_empty() {
             // Return empty tensor with correct shape
-            return Ok(Tensor::zeros((1, 0, self.config.hidden_size), candle_core::DType::F32, &self.device)?);
+            return Ok(Tensor::zeros(
+                (1, 0, self.config.hidden_size),
+                candle_core::DType::F32,
+                &self.device,
+            )?);
         }
 
         let ids: Vec<u32> = token_ids.to_vec();
@@ -940,11 +951,7 @@ impl TalkerModel {
     }
 
     /// Autoregressive generation
-    pub fn generate(
-        &self,
-        input_ids: &Tensor,
-        config: &GenerationConfig,
-    ) -> Result<Vec<u32>> {
+    pub fn generate(&self, input_ids: &Tensor, config: &GenerationConfig) -> Result<Vec<u32>> {
         let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
             .map(|_| KVCache::new())
             .collect();
@@ -990,11 +997,7 @@ impl TalkerModel {
     }
 
     /// Get the hidden state at last position (for code predictor input)
-    pub fn get_last_hidden(
-        &self,
-        input_ids: &Tensor,
-        kv_caches: &mut [KVCache],
-    ) -> Result<Tensor> {
+    pub fn get_last_hidden(&self, input_ids: &Tensor, kv_caches: &mut [KVCache]) -> Result<Tensor> {
         let (hidden, _logits) = self.prefill(input_ids, kv_caches)?;
         let seq_len = hidden.dim(1)?;
         Ok(hidden.i((.., seq_len - 1..seq_len, ..))?)

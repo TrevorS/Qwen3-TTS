@@ -339,7 +339,8 @@ impl CodePredictor {
             // Forward through layers (single token, using KV cache)
             let mut hidden = code_embed;
             for (i, layer) in self.layers.iter().enumerate() {
-                hidden = layer.forward(&hidden, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
+                hidden =
+                    layer.forward(&hidden, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
             }
             hidden = self.norm.forward(&hidden)?;
 
@@ -373,9 +374,18 @@ impl CodePredictor {
     ///
     /// group_idx: 0-14 for acoustic groups 2-16
     /// Returns: [1, 1, codec_embed_dim] tensor
-    pub fn get_acoustic_embedding(&self, code: u32, group_idx: usize, device: &candle_core::Device) -> Result<Tensor> {
+    pub fn get_acoustic_embedding(
+        &self,
+        code: u32,
+        group_idx: usize,
+        device: &candle_core::Device,
+    ) -> Result<Tensor> {
         if group_idx >= self.codec_embeddings.len() {
-            anyhow::bail!("Invalid group_idx {} (max {})", group_idx, self.codec_embeddings.len() - 1);
+            anyhow::bail!(
+                "Invalid group_idx {} (max {})",
+                group_idx,
+                self.codec_embeddings.len() - 1
+            );
         }
         let code_tensor = Tensor::new(&[code], device)?;
         let embed = self.codec_embeddings[group_idx].forward(&code_tensor)?;
@@ -386,9 +396,17 @@ impl CodePredictor {
     ///
     /// acoustic_codes: 15 acoustic codes for groups 2-16
     /// Returns: [1, 1, codec_embed_dim] tensor with summed embeddings
-    pub fn get_acoustic_embeddings_sum(&self, acoustic_codes: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+    pub fn get_acoustic_embeddings_sum(
+        &self,
+        acoustic_codes: &[u32],
+        device: &candle_core::Device,
+    ) -> Result<Tensor> {
         if acoustic_codes.len() != self.codec_embeddings.len() {
-            anyhow::bail!("Expected {} acoustic codes, got {}", self.codec_embeddings.len(), acoustic_codes.len());
+            anyhow::bail!(
+                "Expected {} acoustic codes, got {}",
+                self.codec_embeddings.len(),
+                acoustic_codes.len()
+            );
         }
 
         let mut sum: Option<Tensor> = None;

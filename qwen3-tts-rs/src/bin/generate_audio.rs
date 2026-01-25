@@ -18,7 +18,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use qwen3_tts::{generation, models, AudioBuffer};
+use qwen3_tts::{generation, models, tokenizer, AudioBuffer};
 
 /// Generate reference audio with deterministic seed for comparison
 #[derive(Parser, Debug)]
@@ -67,6 +67,10 @@ struct Args {
     /// Python reference directory
     #[arg(long, default_value = "test_data/reference_audio")]
     reference_dir: String,
+
+    /// Tokenizer directory (defaults to model_dir/../tokenizer)
+    #[arg(long)]
+    tokenizer_dir: Option<String>,
 }
 
 /// Metadata for generated audio
@@ -82,26 +86,6 @@ struct GenerationMetadata {
     codes_shape: Vec<usize>,
     audio_samples: usize,
     sample_rate: u32,
-}
-
-/// Text to token mapping (simplified - matches Python script)
-fn text_to_ids(text: &str) -> Vec<u32> {
-    match text {
-        "Hello" => vec![9707],
-        "Hello world" => vec![9707, 1879],
-        "Hello, this is a" => vec![9707, 11, 419, 374, 264],
-        "Hello, this is a test" => vec![9707, 11, 419, 374, 264, 1273],
-        "The quick brown fox jumps over the lazy dog. This is a test of the text to speech system." => {
-            vec![785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 1096, 374, 264, 1273, 315, 279, 1467, 311, 8806, 1849, 13]
-        }
-        "The quick brown fox jumps over the lazy dog near the riverbank while the sun sets behind the distant mountains casting golden light across the peaceful valley below" => {
-            vec![785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 3143, 279, 14796, 17033, 1393, 279, 7015, 7289, 4815, 279, 28727, 23501, 24172, 20748, 3100, 3941, 279, 25650, 33581, 3685]
-        }
-        _ => {
-            eprintln!("Warning: Text '{}' not in tokenizer mapping, using 'Hello'", text);
-            vec![9707]
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -127,7 +111,11 @@ fn main() -> Result<()> {
 
     // Set seed
     generation::set_seed(args.seed);
-    println!("\nSeed set: {} (is_seeded: {})", args.seed, generation::is_seeded());
+    println!(
+        "\nSeed set: {} (is_seeded: {})",
+        args.seed,
+        generation::is_seeded()
+    );
 
     // Reset RNG to ensure deterministic starting point
     generation::reset_rng();
@@ -146,8 +134,20 @@ fn main() -> Result<()> {
     let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
     let decoder_weights = load_weights(&decoder_path, &device)?;
 
-    // Get input IDs
-    let input_ids = text_to_ids(&args.text);
+    // Load tokenizer
+    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| {
+        Path::new(&args.model_dir)
+            .parent()
+            .map(|p| p.join("tokenizer"))
+            .unwrap_or_else(|| Path::new("tokenizer").to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    });
+    println!("Loading tokenizer from {}...", tokenizer_dir);
+    let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
+
+    // Tokenize text
+    let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
     let input_tensor = Tensor::new(input_ids.as_slice(), &device)?.unsqueeze(0)?;
 
@@ -169,7 +169,9 @@ fn main() -> Result<()> {
     let progress = ProgressBar::new(num_frames as u64);
     progress.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames")?
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} frames",
+            )?
             .progress_chars("#>-"),
     );
 
@@ -205,7 +207,11 @@ fn main() -> Result<()> {
     let semantic_embed = talker.get_codec_embedding(first_token_id)?;
     let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
 
-    println!("Frame 0: semantic={}, acoustics={:?}...", first_token_id, &acoustic_codes[..3.min(acoustic_codes.len())]);
+    println!(
+        "Frame 0: semantic={}, acoustics={:?}...",
+        first_token_id,
+        &acoustic_codes[..3.min(acoustic_codes.len())]
+    );
 
     let mut frame_codes = vec![first_token_id];
     frame_codes.extend(acoustic_codes);
@@ -225,10 +231,16 @@ fn main() -> Result<()> {
 
         // Generate acoustic tokens
         let semantic_embed = talker.get_codec_embedding(next_token_id)?;
-        let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        let acoustic_codes =
+            code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
 
         if frame_idx < 5 || frame_idx == num_frames - 1 {
-            println!("Frame {}: semantic={}, acoustics={:?}...", frame_idx, next_token_id, &acoustic_codes[..3.min(acoustic_codes.len())]);
+            println!(
+                "Frame {}: semantic={}, acoustics={:?}...",
+                frame_idx,
+                next_token_id,
+                &acoustic_codes[..3.min(acoustic_codes.len())]
+            );
         } else if frame_idx == 5 {
             println!("...");
         }
@@ -246,7 +258,8 @@ fn main() -> Result<()> {
     println!("\nCodes tensor shape: {:?}", codes_tensor.shape());
 
     // Save codes as binary
-    let codes_bin_path = output_dir.join(format!("codes_seed{}_frames{}.bin", args.seed, num_frames));
+    let codes_bin_path =
+        output_dir.join(format!("codes_seed{}_frames{}.bin", args.seed, num_frames));
     save_codes_binary(&all_codes, &codes_bin_path)?;
     println!("Saved binary codes to: {:?}", codes_bin_path);
 
@@ -254,7 +267,11 @@ fn main() -> Result<()> {
     println!("\nDecoding to audio...");
     let waveform = decoder.decode(&codes_tensor)?;
     let audio_samples: Vec<f32> = waveform.flatten_all()?.to_vec1()?;
-    println!("Audio samples: {} ({:.3}s at 24kHz)", audio_samples.len(), audio_samples.len() as f64 / 24000.0);
+    println!(
+        "Audio samples: {} ({:.3}s at 24kHz)",
+        audio_samples.len(),
+        audio_samples.len() as f64 / 24000.0
+    );
 
     // Save audio as WAV
     let wav_path = output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, num_frames));
@@ -263,7 +280,8 @@ fn main() -> Result<()> {
     println!("Saved WAV to: {:?}", wav_path);
 
     // Save audio as binary
-    let audio_bin_path = output_dir.join(format!("audio_seed{}_frames{}.bin", args.seed, num_frames));
+    let audio_bin_path =
+        output_dir.join(format!("audio_seed{}_frames{}.bin", args.seed, num_frames));
     save_audio_binary(&audio_samples, &audio_bin_path)?;
     println!("Saved binary audio to: {:?}", audio_bin_path);
 
@@ -280,7 +298,10 @@ fn main() -> Result<()> {
         audio_samples: audio_samples.len(),
         sample_rate: 24000,
     };
-    let metadata_path = output_dir.join(format!("metadata_seed{}_frames{}.json", args.seed, num_frames));
+    let metadata_path = output_dir.join(format!(
+        "metadata_seed{}_frames{}.json",
+        args.seed, num_frames
+    ));
     let metadata_file = File::create(&metadata_path)?;
     serde_json::to_writer_pretty(metadata_file, &metadata)?;
     println!("Saved metadata to: {:?}", metadata_path);
@@ -288,7 +309,13 @@ fn main() -> Result<()> {
     // Compare with Python reference if requested
     if args.compare {
         println!("\n=== Comparing with Python Reference ===");
-        compare_with_reference(&args.reference_dir, args.seed, num_frames, &all_codes, &audio_samples)?;
+        compare_with_reference(
+            &args.reference_dir,
+            args.seed,
+            num_frames,
+            &all_codes,
+            &audio_samples,
+        )?;
     }
 
     // Clear seed
@@ -400,7 +427,10 @@ fn compare_with_reference(
 
         // Compare codes
         let codes_match = py_codes.len() == rust_codes_flat.len()
-            && py_codes.iter().zip(rust_codes_flat.iter()).all(|(a, b)| a == b);
+            && py_codes
+                .iter()
+                .zip(rust_codes_flat.iter())
+                .all(|(a, b)| a == b);
 
         if codes_match {
             println!("Codes: MATCH (all {} values identical)", py_codes.len());
@@ -415,7 +445,10 @@ fn compare_with_reference(
             for i in 0..min_len {
                 if py_codes[i] != rust_codes_flat[i] {
                     if diff_count < 5 {
-                        println!("  Index {}: Python={}, Rust={}", i, py_codes[i], rust_codes_flat[i]);
+                        println!(
+                            "  Index {}: Python={}, Rust={}",
+                            i, py_codes[i], rust_codes_flat[i]
+                        );
                     }
                     diff_count += 1;
                 }

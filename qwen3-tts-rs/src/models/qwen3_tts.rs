@@ -32,7 +32,11 @@ impl RotaryEmbedding {
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
 
-        Ok(Self { cos, sin, _dim: dim })
+        Ok(Self {
+            cos,
+            sin,
+            _dim: dim,
+        })
     }
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
@@ -98,12 +102,7 @@ impl MRoPE {
     /// - 20 frequency pairs for width (W)
     ///
     /// Total = 64 = head_dim / 2
-    pub fn new(
-        dim: usize,
-        theta: f64,
-        mrope_section: [usize; 3],
-        device: &Device,
-    ) -> Result<Self> {
+    pub fn new(dim: usize, theta: f64, mrope_section: [usize; 3], device: &Device) -> Result<Self> {
         let half_dim = dim / 2;
 
         // Compute inverse frequencies
@@ -145,7 +144,13 @@ impl MRoPE {
     /// - q, k: [batch, heads, seq_len, head_dim]
     /// - offset: position offset for KV cache
     /// - seq_len: sequence length
-    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
+    pub fn apply(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        offset: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
         // Generate position IDs for all 3 dimensions (same values for TTS)
         let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
         let pos = Tensor::new(positions.as_slice(), &self.device)?; // [seq_len]
@@ -470,12 +475,32 @@ impl KVCache {
 
     /// Get K cache sum for debugging
     pub fn k_sum(&self) -> f32 {
-        self.k.as_ref().map(|k| k.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().sum()).unwrap_or(0.0)
+        self.k
+            .as_ref()
+            .map(|k| {
+                k.flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .sum()
+            })
+            .unwrap_or(0.0)
     }
 
     /// Get V cache sum for debugging
     pub fn v_sum(&self) -> f32 {
-        self.v.as_ref().map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().sum()).unwrap_or(0.0)
+        self.v
+            .as_ref()
+            .map(|v| {
+                v.flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .sum()
+            })
+            .unwrap_or(0.0)
     }
 
     /// Get K cache shape for debugging

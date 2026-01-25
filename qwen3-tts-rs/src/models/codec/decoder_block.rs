@@ -370,7 +370,8 @@ mod tests {
         let input = Tensor::randn(0.0f32, 1.0, (1, in_dim, 4), &device).unwrap();
         let output = block.forward(&input).unwrap();
 
-        // Output should be upsampled: [1, 64, 4*4=16]
-        assert_eq!(output.dims(), &[1, out_dim, 16]);
+        // Output is upsampled with causal trimming: (input-1)*rate = (4-1)*4 = 12
+        // Note: CausalTransConv trims kernel_size - stride from both sides
+        assert_eq!(output.dims(), &[1, out_dim, 12]);
     }
 }

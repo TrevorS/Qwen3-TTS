@@ -15,12 +15,9 @@ fn load_weights(path: &str) -> Result<HashMap<String, Tensor>> {
     let mut weights = HashMap::new();
     for name in safetensors.names() {
         let view = safetensors.tensor(name)?;
-        let tensor = Tensor::from_raw_buffer(
-            view.data(),
-            view.dtype().try_into()?,
-            view.shape(),
-            &device,
-        )?.to_dtype(DType::F32)?;
+        let tensor =
+            Tensor::from_raw_buffer(view.data(), view.dtype().try_into()?, view.shape(), &device)?
+                .to_dtype(DType::F32)?;
         weights.insert(name.to_string(), tensor);
     }
     Ok(weights)
@@ -60,23 +57,35 @@ fn compare_with_python(rust_tensor: &Tensor, python_file: &str, stage_name: &str
     let python_flat = load_f32_bin(python_file)?;
 
     if rust_flat.len() != python_flat.len() {
-        println!("  {} LENGTH MISMATCH: rust={}, python={}", stage_name, rust_flat.len(), python_flat.len());
+        println!(
+            "  {} LENGTH MISMATCH: rust={}, python={}",
+            stage_name,
+            rust_flat.len(),
+            python_flat.len()
+        );
         return Ok(f32::MAX);
     }
 
-    let max_diff = rust_flat.iter().zip(python_flat.iter())
+    let max_diff = rust_flat
+        .iter()
+        .zip(python_flat.iter())
         .map(|(r, p)| (r - p).abs())
         .fold(0.0f32, f32::max);
 
-    let mean_diff: f32 = rust_flat.iter().zip(python_flat.iter())
+    let mean_diff: f32 = rust_flat
+        .iter()
+        .zip(python_flat.iter())
         .map(|(r, p)| (r - p).abs())
-        .sum::<f32>() / rust_flat.len() as f32;
+        .sum::<f32>()
+        / rust_flat.len() as f32;
 
     let python_mean: f32 = python_flat.iter().sum::<f32>() / python_flat.len() as f32;
     let rust_mean: f32 = rust_flat.iter().sum::<f32>() / rust_flat.len() as f32;
 
-    println!("  {} - Rust mean={:.6}, Python mean={:.6}, max_diff={:.6}, mean_diff={:.6}",
-        stage_name, rust_mean, python_mean, max_diff, mean_diff);
+    println!(
+        "  {} - Rust mean={:.6}, Python mean={:.6}, max_diff={:.6}, mean_diff={:.6}",
+        stage_name, rust_mean, python_mean, max_diff, mean_diff
+    );
 
     Ok(max_diff)
 }
@@ -146,13 +155,16 @@ fn test_decoder_stages_compare() -> Result<()> {
     // =====================
     // Stage 1: Quantizer
     // =====================
-    let first_embedding_sum = weights.get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum")
+    let first_embedding_sum = weights
+        .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let first_cluster_usage = weights.get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
+    let first_cluster_usage = weights
+        .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
     let first_cluster_usage_clamped = first_cluster_usage.clamp(epsilon, f32::MAX)?;
-    let first_codebook = first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
+    let first_codebook =
+        first_embedding_sum.broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
 
     let codebook_size = 2048i64;
     let mut quantized = Tensor::zeros((batch_size, seq_len, codebook_dim), DType::F32, &device)?;
@@ -160,7 +172,10 @@ fn test_decoder_stages_compare() -> Result<()> {
     // First quantizer
     let first_codes = codes.i((.., 0, ..))?;
     let first_codes_flat: Vec<i64> = first_codes.flatten_all()?.to_vec1()?;
-    let first_codes_mod: Vec<i64> = first_codes_flat.iter().map(|&c| c % codebook_size).collect();
+    let first_codes_mod: Vec<i64> = first_codes_flat
+        .iter()
+        .map(|&c| c % codebook_size)
+        .collect();
     let first_codes_tensor = Tensor::from_vec(first_codes_mod, (seq_len,), &device)?;
     let first_embed = first_codebook.index_select(&first_codes_tensor, 0)?;
     let first_embed = first_embed.reshape((batch_size, seq_len, codebook_dim))?;
@@ -168,9 +183,17 @@ fn test_decoder_stages_compare() -> Result<()> {
 
     // Rest quantizers
     for i in 0..15 {
-        let embedding_sum = weights.get(&format!("decoder.quantizer.rvq_rest.vq.layers.{}._codebook.embedding_sum", i))
+        let embedding_sum = weights
+            .get(&format!(
+                "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.embedding_sum",
+                i
+            ))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let cluster_usage = weights.get(&format!("decoder.quantizer.rvq_rest.vq.layers.{}._codebook.cluster_usage", i))
+        let cluster_usage = weights
+            .get(&format!(
+                "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.cluster_usage",
+                i
+            ))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
         let cluster_usage_clamped = cluster_usage.clamp(epsilon, f32::MAX)?;
@@ -185,7 +208,8 @@ fn test_decoder_stages_compare() -> Result<()> {
     }
 
     // Output projection
-    let proj_weight = weights.get("decoder.quantizer.rvq_first.output_proj.weight")
+    let proj_weight = weights
+        .get("decoder.quantizer.rvq_first.output_proj.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?
         .squeeze(2)?;
 
@@ -194,16 +218,22 @@ fn test_decoder_stages_compare() -> Result<()> {
     let quantized = quantized_out.reshape((batch_size, seq_len, 512))?;
 
     println!("\nStage 1 (Quantized):");
-    let diff1 = compare_with_python(&quantized, "test_data/debug_stages/stage1_quantized.bin", "Quantized")?;
+    let diff1 = compare_with_python(
+        &quantized,
+        "test_data/debug_stages/stage1_quantized.bin",
+        "Quantized",
+    )?;
     assert!(diff1 < 0.0001, "Stage 1 diverged: max_diff={}", diff1);
 
     // =====================
     // Stage 2: Pre-conv
     // =====================
     let hidden = quantized.transpose(1, 2)?; // [batch, 512, seq]
-    let pre_conv_w = weights.get("decoder.pre_conv.conv.weight")
+    let pre_conv_w = weights
+        .get("decoder.pre_conv.conv.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let pre_conv_b = weights.get("decoder.pre_conv.conv.bias")
+    let pre_conv_b = weights
+        .get("decoder.pre_conv.conv.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
     let kernel_size = pre_conv_w.dim(2)?;
 
@@ -212,24 +242,36 @@ fn test_decoder_stages_compare() -> Result<()> {
     let hidden = hidden.broadcast_add(&pre_conv_b.unsqueeze(0)?.unsqueeze(2)?)?;
 
     println!("\nStage 2 (Pre-conv):");
-    let diff2 = compare_with_python(&hidden, "test_data/debug_stages/stage2_preconv.bin", "Pre-conv")?;
+    let diff2 = compare_with_python(
+        &hidden,
+        "test_data/debug_stages/stage2_preconv.bin",
+        "Pre-conv",
+    )?;
     assert!(diff2 < 0.0001, "Stage 2 diverged: max_diff={}", diff2);
 
     // =====================
     // Stage 3a: Input projection
     // =====================
     let mut hidden = hidden.transpose(1, 2)?; // [batch, seq, 1024]
-    let input_proj_w = weights.get("decoder.pre_transformer.input_proj.weight")
+    let input_proj_w = weights
+        .get("decoder.pre_transformer.input_proj.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let input_proj_b = weights.get("decoder.pre_transformer.input_proj.bias")
+    let input_proj_b = weights
+        .get("decoder.pre_transformer.input_proj.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
     let hidden_2d = hidden.reshape((batch_size * seq_len, hidden.dim(2)?))?;
-    let hidden_out = hidden_2d.matmul(&input_proj_w.t()?)?.broadcast_add(input_proj_b)?;
+    let hidden_out = hidden_2d
+        .matmul(&input_proj_w.t()?)?
+        .broadcast_add(input_proj_b)?;
     hidden = hidden_out.reshape((batch_size, seq_len, input_proj_w.dim(0)?))?;
 
     println!("\nStage 3a (Input proj):");
-    let diff3a = compare_with_python(&hidden, "test_data/debug_stages/stage3a_input_proj.bin", "Input proj")?;
+    let diff3a = compare_with_python(
+        &hidden,
+        "test_data/debug_stages/stage3a_input_proj.bin",
+        "Input proj",
+    )?;
     assert!(diff3a < 0.0001, "Stage 3a diverged: max_diff={}", diff3a);
 
     // =====================
@@ -259,7 +301,8 @@ fn test_decoder_stages_compare() -> Result<()> {
         }
     }
     let causal_mask = Tensor::from_vec(mask_data, (seq_len, seq_len), &device)?
-        .unsqueeze(0)?.unsqueeze(0)?;
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
 
     // All transformer layers
     let num_layers = 8;
@@ -267,27 +310,43 @@ fn test_decoder_stages_compare() -> Result<()> {
         let prefix = format!("decoder.pre_transformer.layers.{}", layer_idx);
 
         // RMS Norm
-        let ln_w = weights.get(&format!("{}.input_layernorm.weight", prefix))
+        let ln_w = weights
+            .get(&format!("{}.input_layernorm.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let normed = rms_norm(&hidden, ln_w)?;
 
         // Q/K/V projections
-        let q_w = weights.get(&format!("{}.self_attn.q_proj.weight", prefix))
+        let q_w = weights
+            .get(&format!("{}.self_attn.q_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let k_w = weights.get(&format!("{}.self_attn.k_proj.weight", prefix))
+        let k_w = weights
+            .get(&format!("{}.self_attn.k_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let v_w = weights.get(&format!("{}.self_attn.v_proj.weight", prefix))
+        let v_w = weights
+            .get(&format!("{}.self_attn.v_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
         let normed_2d = normed.reshape((batch_size * seq_len, normed.dim(2)?))?;
-        let q = normed_2d.matmul(&q_w.t()?)?.reshape((batch_size, seq_len, q_w.dim(0)?))?;
-        let k = normed_2d.matmul(&k_w.t()?)?.reshape((batch_size, seq_len, k_w.dim(0)?))?;
-        let v = normed_2d.matmul(&v_w.t()?)?.reshape((batch_size, seq_len, v_w.dim(0)?))?;
+        let q = normed_2d
+            .matmul(&q_w.t()?)?
+            .reshape((batch_size, seq_len, q_w.dim(0)?))?;
+        let k = normed_2d
+            .matmul(&k_w.t()?)?
+            .reshape((batch_size, seq_len, k_w.dim(0)?))?;
+        let v = normed_2d
+            .matmul(&v_w.t()?)?
+            .reshape((batch_size, seq_len, v_w.dim(0)?))?;
 
         // Reshape for multi-head attention
-        let q = q.reshape((batch_size, seq_len, num_heads, head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((batch_size, seq_len, num_heads, head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((batch_size, seq_len, num_heads, head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((batch_size, seq_len, num_heads, head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch_size, seq_len, num_heads, head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch_size, seq_len, num_heads, head_dim))?
+            .transpose(1, 2)?;
 
         // Apply RoPE
         let q_rot = apply_rope(&q, &cos, &sin, head_dim)?;
@@ -295,75 +354,104 @@ fn test_decoder_stages_compare() -> Result<()> {
 
         // Attention
         let scale = (head_dim as f64).powf(-0.5);
-        let attn = q_rot.matmul(&k_rot.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?;
+        let attn =
+            q_rot.matmul(&k_rot.transpose(candle_core::D::Minus2, candle_core::D::Minus1)?)?;
         let attn = (attn * scale)?;
         let attn = attn.broadcast_add(&causal_mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let attn_out = attn.matmul(&v)?;
 
         // Reshape back
-        let attn_out = attn_out.transpose(1, 2)?
-            .reshape((batch_size, seq_len, num_heads * head_dim))?;
+        let attn_out =
+            attn_out
+                .transpose(1, 2)?
+                .reshape((batch_size, seq_len, num_heads * head_dim))?;
 
         // Output projection
-        let o_w = weights.get(&format!("{}.self_attn.o_proj.weight", prefix))
+        let o_w = weights
+            .get(&format!("{}.self_attn.o_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let attn_out_2d = attn_out.reshape((batch_size * seq_len, attn_out.dim(2)?))?;
-        let attn_out = attn_out_2d.matmul(&o_w.t()?)?.reshape((batch_size, seq_len, o_w.dim(0)?))?;
+        let attn_out =
+            attn_out_2d
+                .matmul(&o_w.t()?)?
+                .reshape((batch_size, seq_len, o_w.dim(0)?))?;
 
         // Layer scale and residual
-        let attn_scale = weights.get(&format!("{}.self_attn_layer_scale.scale", prefix))
+        let attn_scale = weights
+            .get(&format!("{}.self_attn_layer_scale.scale", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let attn_out = attn_out.broadcast_mul(attn_scale)?;
         hidden = (hidden + attn_out)?;
 
         // MLP
-        let post_ln_w = weights.get(&format!("{}.post_attention_layernorm.weight", prefix))
+        let post_ln_w = weights
+            .get(&format!("{}.post_attention_layernorm.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let mlp_input = rms_norm(&hidden, post_ln_w)?;
 
-        let gate_w = weights.get(&format!("{}.mlp.gate_proj.weight", prefix))
+        let gate_w = weights
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let up_w = weights.get(&format!("{}.mlp.up_proj.weight", prefix))
+        let up_w = weights
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let down_w = weights.get(&format!("{}.mlp.down_proj.weight", prefix))
+        let down_w = weights
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
         let mlp_input_2d = mlp_input.reshape((batch_size * seq_len, mlp_input.dim(2)?))?;
         let gate = mlp_input_2d.matmul(&gate_w.t()?)?;
         let up = mlp_input_2d.matmul(&up_w.t()?)?;
         let mlp_out = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        let mlp_out = mlp_out.matmul(&down_w.t()?)?.reshape((batch_size, seq_len, down_w.dim(0)?))?;
+        let mlp_out =
+            mlp_out
+                .matmul(&down_w.t()?)?
+                .reshape((batch_size, seq_len, down_w.dim(0)?))?;
 
         // Layer scale and residual
-        let mlp_scale = weights.get(&format!("{}.mlp_layer_scale.scale", prefix))
+        let mlp_scale = weights
+            .get(&format!("{}.mlp_layer_scale.scale", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let mlp_out = mlp_out.broadcast_mul(mlp_scale)?;
         hidden = (hidden + mlp_out)?;
 
         if layer_idx == 0 {
             println!("\nStage 3b (Layer 0 out):");
-            let diff3b = compare_with_python(&hidden, "test_data/debug_stages/stage3b_layer0_out.bin", "Layer0 out")?;
+            let diff3b = compare_with_python(
+                &hidden,
+                "test_data/debug_stages/stage3b_layer0_out.bin",
+                "Layer0 out",
+            )?;
             assert!(diff3b < 0.001, "Stage 3b diverged: max_diff={}", diff3b);
         }
     }
 
     // Final norm and output projection
-    let final_ln_w = weights.get("decoder.pre_transformer.norm.weight")
+    let final_ln_w = weights
+        .get("decoder.pre_transformer.norm.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
     hidden = rms_norm(&hidden, final_ln_w)?;
 
-    let output_proj_w = weights.get("decoder.pre_transformer.output_proj.weight")
+    let output_proj_w = weights
+        .get("decoder.pre_transformer.output_proj.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let output_proj_b = weights.get("decoder.pre_transformer.output_proj.bias")
+    let output_proj_b = weights
+        .get("decoder.pre_transformer.output_proj.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
     let hidden_2d = hidden.reshape((batch_size * seq_len, hidden.dim(2)?))?;
-    let hidden_out = hidden_2d.matmul(&output_proj_w.t()?)?.broadcast_add(output_proj_b)?;
+    let hidden_out = hidden_2d
+        .matmul(&output_proj_w.t()?)?
+        .broadcast_add(output_proj_b)?;
     hidden = hidden_out.reshape((batch_size, seq_len, output_proj_w.dim(0)?))?;
 
     println!("\nStage 4 (Transformer out):");
-    let diff4 = compare_with_python(&hidden, "test_data/debug_stages/stage4_transformer.bin", "Transformer")?;
+    let diff4 = compare_with_python(
+        &hidden,
+        "test_data/debug_stages/stage4_transformer.bin",
+        "Transformer",
+    )?;
     assert!(diff4 < 0.001, "Stage 4 diverged: max_diff={}", diff4);
 
     // =====================
@@ -376,22 +464,31 @@ fn test_decoder_stages_compare() -> Result<()> {
         let stride = 2;
 
         // Transposed conv
-        let conv_w = weights.get(&format!("{}.0.conv.weight", prefix))
+        let conv_w = weights
+            .get(&format!("{}.0.conv.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let conv_b = weights.get(&format!("{}.0.conv.bias", prefix))
+        let conv_b = weights
+            .get(&format!("{}.0.conv.bias", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
         let kernel_size = conv_w.dim(2)?;
 
-        println!("  Upsample stage {} input: {:?}, mean={:.6}", stage_idx, hidden.dims(),
-            hidden.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  Upsample stage {} input: {:?}, mean={:.6}",
+            stage_idx,
+            hidden.dims(),
+            hidden.mean_all()?.to_vec0::<f32>()?
+        );
 
         // conv_transpose1d params: kernel, padding, output_padding, stride, dilation, groups
         hidden = hidden.conv_transpose1d(conv_w, 0, 0, stride, 1, 1)?;
         hidden = hidden.broadcast_add(&conv_b.unsqueeze(0)?.unsqueeze(2)?)?;
 
-        println!("  After trans_conv: {:?}, mean={:.6}", hidden.dims(),
-            hidden.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After trans_conv: {:?}, mean={:.6}",
+            hidden.dims(),
+            hidden.mean_all()?.to_vec0::<f32>()?
+        );
 
         // Trim for exact upsampling
         let trim = kernel_size - stride;
@@ -400,27 +497,39 @@ fn test_decoder_stages_compare() -> Result<()> {
             hidden = hidden.narrow(2, 0, len - trim)?;
         }
 
-        println!("  After trim: {:?}, mean={:.6}", hidden.dims(),
-            hidden.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After trim: {:?}, mean={:.6}",
+            hidden.dims(),
+            hidden.mean_all()?.to_vec0::<f32>()?
+        );
 
         // ConvNeXt block
-        let dwconv_w = weights.get(&format!("{}.1.dwconv.conv.weight", prefix))
+        let dwconv_w = weights
+            .get(&format!("{}.1.dwconv.conv.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let dwconv_b = weights.get(&format!("{}.1.dwconv.conv.bias", prefix))
+        let dwconv_b = weights
+            .get(&format!("{}.1.dwconv.conv.bias", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let norm_w = weights.get(&format!("{}.1.norm.weight", prefix))
+        let norm_w = weights
+            .get(&format!("{}.1.norm.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let norm_b = weights.get(&format!("{}.1.norm.bias", prefix))
+        let norm_b = weights
+            .get(&format!("{}.1.norm.bias", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let pwconv1_w = weights.get(&format!("{}.1.pwconv1.weight", prefix))
+        let pwconv1_w = weights
+            .get(&format!("{}.1.pwconv1.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let pwconv1_b = weights.get(&format!("{}.1.pwconv1.bias", prefix))
+        let pwconv1_b = weights
+            .get(&format!("{}.1.pwconv1.bias", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let pwconv2_w = weights.get(&format!("{}.1.pwconv2.weight", prefix))
+        let pwconv2_w = weights
+            .get(&format!("{}.1.pwconv2.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let pwconv2_b = weights.get(&format!("{}.1.pwconv2.bias", prefix))
+        let pwconv2_b = weights
+            .get(&format!("{}.1.pwconv2.bias", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let gamma = weights.get(&format!("{}.1.gamma", prefix))
+        let gamma = weights
+            .get(&format!("{}.1.gamma", prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing"))?;
 
         let residual = hidden.clone();
@@ -430,8 +539,11 @@ fn test_decoder_stages_compare() -> Result<()> {
         let mut x = x_padded.conv1d(dwconv_w, 0, 1, 1, channels)?; // depthwise
         x = x.broadcast_add(&dwconv_b.unsqueeze(0)?.unsqueeze(2)?)?;
 
-        println!("  After dwconv: {:?}, mean={:.6}", x.dims(),
-            x.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After dwconv: {:?}, mean={:.6}",
+            x.dims(),
+            x.mean_all()?.to_vec0::<f32>()?
+        );
 
         // Transpose to [batch, seq, channels] for layernorm
         x = x.transpose(1, 2)?;
@@ -445,8 +557,11 @@ fn test_decoder_stages_compare() -> Result<()> {
         let x_norm = x_centered.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
         x = x_norm.broadcast_mul(norm_w)?.broadcast_add(norm_b)?;
 
-        println!("  After layernorm: {:?}, mean={:.6}", x.dims(),
-            x.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After layernorm: {:?}, mean={:.6}",
+            x.dims(),
+            x.mean_all()?.to_vec0::<f32>()?
+        );
 
         // Pointwise convs
         x = x.matmul(&pwconv1_w.t()?)?.broadcast_add(pwconv1_b)?;
@@ -454,26 +569,38 @@ fn test_decoder_stages_compare() -> Result<()> {
         x = x.matmul(&pwconv2_w.t()?)?.broadcast_add(pwconv2_b)?;
         x = x.broadcast_mul(gamma)?;
 
-        println!("  After pwconv: {:?}, mean={:.6}", x.dims(),
-            x.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After pwconv: {:?}, mean={:.6}",
+            x.dims(),
+            x.mean_all()?.to_vec0::<f32>()?
+        );
 
         x = x.reshape((b, s, c))?.transpose(1, 2)?;
         hidden = (residual + x)?;
 
-        println!("  After ConvNeXt block: {:?}, mean={:.6}", hidden.dims(),
-            hidden.mean_all()?.to_vec0::<f32>()?);
+        println!(
+            "  After ConvNeXt block: {:?}, mean={:.6}",
+            hidden.dims(),
+            hidden.mean_all()?.to_vec0::<f32>()?
+        );
     }
 
     println!("\nStage 5 (Upsample):");
-    let diff5 = compare_with_python(&hidden, "test_data/debug_stages/stage5_upsample.bin", "Upsample")?;
+    let diff5 = compare_with_python(
+        &hidden,
+        "test_data/debug_stages/stage5_upsample.bin",
+        "Upsample",
+    )?;
     assert!(diff5 < 0.1, "Stage 5 diverged: max_diff={}", diff5);
 
     // =====================
     // Stage 6: Decoder blocks
     // =====================
-    let init_conv_w = weights.get("decoder.decoder.0.conv.weight")
+    let init_conv_w = weights
+        .get("decoder.decoder.0.conv.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let init_conv_b = weights.get("decoder.decoder.0.conv.bias")
+    let init_conv_b = weights
+        .get("decoder.decoder.0.conv.bias")
         .ok_or_else(|| anyhow::anyhow!("Missing"))?;
     let k = init_conv_w.dim(2)?;
     hidden = hidden.pad_with_zeros(2, k - 1, 0)?;
@@ -481,7 +608,11 @@ fn test_decoder_stages_compare() -> Result<()> {
     hidden = hidden.broadcast_add(&init_conv_b.unsqueeze(0)?.unsqueeze(2)?)?;
 
     println!("\nStage 6.0 (decoder.0):");
-    let diff60 = compare_with_python(&hidden, "test_data/debug_stages/stage6_decoder0.bin", "decoder.0")?;
+    let diff60 = compare_with_python(
+        &hidden,
+        "test_data/debug_stages/stage6_decoder0.bin",
+        "decoder.0",
+    )?;
     assert!(diff60 < 0.1, "Stage 6.0 diverged: max_diff={}", diff60);
 
     let upsample_rates = [8, 5, 4, 3];
@@ -491,13 +622,21 @@ fn test_decoder_stages_compare() -> Result<()> {
         let prefix = format!("decoder.decoder.{}.block", block_idx + 1);
 
         // Initial SnakeBeta
-        let alpha = weights.get(&format!("{}.0.alpha", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let beta = weights.get(&format!("{}.0.beta", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+        let alpha = weights
+            .get(&format!("{}.0.alpha", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+        let beta = weights
+            .get(&format!("{}.0.beta", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         hidden = snake_beta(&hidden, alpha, beta)?;
 
         // Transposed conv
-        let conv_w = weights.get(&format!("{}.1.conv.weight", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-        let conv_b = weights.get(&format!("{}.1.conv.bias", prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+        let conv_w = weights
+            .get(&format!("{}.1.conv.weight", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+        let conv_b = weights
+            .get(&format!("{}.1.conv.bias", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing"))?;
         let kernel_size = conv_w.dim(2)?;
 
         // conv_transpose1d params: kernel, padding, output_padding, stride, dilation, groups
@@ -517,24 +656,40 @@ fn test_decoder_stages_compare() -> Result<()> {
             let residual_input = hidden.clone();
 
             // Act1 -> Conv1 -> Act2 -> Conv2
-            let act1_alpha = weights.get(&format!("{}.act1.alpha", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-            let act1_beta = weights.get(&format!("{}.act1.beta", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let act1_alpha = weights
+                .get(&format!("{}.act1.alpha", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let act1_beta = weights
+                .get(&format!("{}.act1.beta", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
             let mut x = snake_beta(&hidden, act1_alpha, act1_beta)?;
 
-            let conv1_w = weights.get(&format!("{}.conv1.conv.weight", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-            let conv1_b = weights.get(&format!("{}.conv1.conv.bias", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let conv1_w = weights
+                .get(&format!("{}.conv1.conv.weight", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let conv1_b = weights
+                .get(&format!("{}.conv1.conv.bias", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
             let k = conv1_w.dim(2)?;
             let padding = (k - 1) * dilation;
             x = x.pad_with_zeros(2, padding, 0)?;
             x = x.conv1d(conv1_w, 0, 1, dilation, 1)?;
             x = x.broadcast_add(&conv1_b.unsqueeze(0)?.unsqueeze(2)?)?;
 
-            let act2_alpha = weights.get(&format!("{}.act2.alpha", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-            let act2_beta = weights.get(&format!("{}.act2.beta", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let act2_alpha = weights
+                .get(&format!("{}.act2.alpha", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let act2_beta = weights
+                .get(&format!("{}.act2.beta", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
             x = snake_beta(&x, act2_alpha, act2_beta)?;
 
-            let conv2_w = weights.get(&format!("{}.conv2.conv.weight", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
-            let conv2_b = weights.get(&format!("{}.conv2.conv.bias", res_prefix)).ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let conv2_w = weights
+                .get(&format!("{}.conv2.conv.weight", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+            let conv2_b = weights
+                .get(&format!("{}.conv2.conv.bias", res_prefix))
+                .ok_or_else(|| anyhow::anyhow!("Missing"))?;
             let k = conv2_w.dim(2)?;
             x = x.pad_with_zeros(2, k - 1, 0)?;
             x = x.conv1d(conv2_w, 0, 1, 1, 1)?;
@@ -543,21 +698,39 @@ fn test_decoder_stages_compare() -> Result<()> {
             hidden = (residual_input + x)?;
         }
 
-        let stage_file = format!("test_data/debug_stages/stage6_{}_decoder{}.bin", block_idx + 1, block_idx + 1);
+        let stage_file = format!(
+            "test_data/debug_stages/stage6_{}_decoder{}.bin",
+            block_idx + 1,
+            block_idx + 1
+        );
         println!("\nStage 6.{} (decoder.{}):", block_idx + 1, block_idx + 1);
-        let diff = compare_with_python(&hidden, &stage_file, &format!("decoder.{}", block_idx + 1))?;
-        assert!(diff < 1.0, "Stage 6.{} diverged: max_diff={}", block_idx + 1, diff);
+        let diff =
+            compare_with_python(&hidden, &stage_file, &format!("decoder.{}", block_idx + 1))?;
+        assert!(
+            diff < 1.0,
+            "Stage 6.{} diverged: max_diff={}",
+            block_idx + 1,
+            diff
+        );
     }
 
     // =====================
     // Stage 7: Final
     // =====================
-    let final_alpha = weights.get("decoder.decoder.5.alpha").ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let final_beta = weights.get("decoder.decoder.5.beta").ok_or_else(|| anyhow::anyhow!("Missing"))?;
+    let final_alpha = weights
+        .get("decoder.decoder.5.alpha")
+        .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+    let final_beta = weights
+        .get("decoder.decoder.5.beta")
+        .ok_or_else(|| anyhow::anyhow!("Missing"))?;
     hidden = snake_beta(&hidden, final_alpha, final_beta)?;
 
-    let final_conv_w = weights.get("decoder.decoder.6.conv.weight").ok_or_else(|| anyhow::anyhow!("Missing"))?;
-    let final_conv_b = weights.get("decoder.decoder.6.conv.bias").ok_or_else(|| anyhow::anyhow!("Missing"))?;
+    let final_conv_w = weights
+        .get("decoder.decoder.6.conv.weight")
+        .ok_or_else(|| anyhow::anyhow!("Missing"))?;
+    let final_conv_b = weights
+        .get("decoder.decoder.6.conv.bias")
+        .ok_or_else(|| anyhow::anyhow!("Missing"))?;
     let k = final_conv_w.dim(2)?;
     hidden = hidden.pad_with_zeros(2, k - 1, 0)?;
     hidden = hidden.conv1d(final_conv_w, 0, 1, 1, 1)?;
@@ -570,7 +743,10 @@ fn test_decoder_stages_compare() -> Result<()> {
     let diff7 = compare_with_python(&hidden, "test_data/debug_stages/stage7_final.bin", "Final")?;
 
     if diff7 > 0.01 {
-        println!("\n*** SIGNIFICANT DIVERGENCE at Final stage: {:.6} ***", diff7);
+        println!(
+            "\n*** SIGNIFICANT DIVERGENCE at Final stage: {:.6} ***",
+            diff7
+        );
     }
 
     Ok(())
@@ -626,16 +802,30 @@ fn test_decode_75_frames() -> Result<()> {
 
     let rust_audio: Vec<f32> = audio.flatten_all()?.to_vec1()?;
 
-    println!("Rust audio: {} samples, mean={:.6}", rust_audio.len(), rust_audio.iter().sum::<f32>() / rust_audio.len() as f32);
-    println!("Python audio: {} samples, mean={:.6}", python_audio.len(), python_audio.iter().sum::<f32>() / python_audio.len() as f32);
+    println!(
+        "Rust audio: {} samples, mean={:.6}",
+        rust_audio.len(),
+        rust_audio.iter().sum::<f32>() / rust_audio.len() as f32
+    );
+    println!(
+        "Python audio: {} samples, mean={:.6}",
+        python_audio.len(),
+        python_audio.iter().sum::<f32>() / python_audio.len() as f32
+    );
 
-    let max_diff = rust_audio.iter().zip(python_audio.iter())
+    let max_diff = rust_audio
+        .iter()
+        .zip(python_audio.iter())
         .map(|(r, p)| (r - p).abs())
         .fold(0.0f32, f32::max);
 
     println!("Max diff: {:.6}", max_diff);
 
-    assert!(max_diff < 0.001, "Max diff should be < 0.001, got {}", max_diff);
+    assert!(
+        max_diff < 0.001,
+        "Max diff should be < 0.001, got {}",
+        max_diff
+    );
 
     Ok(())
 }
