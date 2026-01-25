@@ -109,11 +109,65 @@ pub fn sample(logits: &Tensor, config: &GenerationConfig) -> Result<Tensor> {
         return greedy_sample(&logits);
     }
 
+    // Apply top-k filtering
+    let logits = if config.top_k > 0 {
+        #[cfg(debug_assertions)]
+        eprintln!("DEBUG SAMPLE: applying top_k={}", config.top_k);
+        top_k_filter(&logits, config.top_k)?
+    } else {
+        logits
+    };
+
+    // Debug: check filtered logits
+    #[cfg(debug_assertions)]
+    {
+        let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
+        let non_neg_inf: Vec<(usize, f32)> = logits_vec
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != f32::NEG_INFINITY)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        eprintln!(
+            "DEBUG SAMPLE: after top-k, {} non-inf values, max at {:?}",
+            non_neg_inf.len(),
+            non_neg_inf
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        );
+    }
+
     // Convert to probabilities
     let probs = candle_nn::ops::softmax_last_dim(&logits)?;
 
     // Sample from distribution
     multinomial_sample(&probs)
+}
+
+/// Apply top-k filtering: keep only the top k logits, set rest to -inf
+fn top_k_filter(logits: &Tensor, k: usize) -> Result<Tensor> {
+    let (batch, vocab) = logits.dims2()?;
+    let k = k.min(vocab);
+
+    let mut result_data = Vec::with_capacity(batch * vocab);
+
+    for b in 0..batch {
+        let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+
+        // Find the k-th largest value
+        let mut sorted = row.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+        let threshold = sorted[k - 1];
+
+        // Mask values below threshold
+        let filtered: Vec<f32> = row
+            .iter()
+            .map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY })
+            .collect();
+        result_data.extend(filtered);
+    }
+
+    Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
 }
 
 /// Compute cumulative sum along last dimension

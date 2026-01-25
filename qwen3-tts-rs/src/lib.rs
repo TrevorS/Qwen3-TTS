@@ -376,8 +376,16 @@ impl Qwen3TTS {
         let seq_len = hidden.dim(1)?;
         let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
 
+        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
+        // vocab_size=3072, codebook_size=2048
+        let logits_suppressed = generation::apply_token_suppression(
+            &logits.squeeze(1)?,
+            3072,
+            config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
+        )?;
+
         // Sample first semantic token
-        let first_token = generation::sample(&logits.squeeze(1)?, config)?;
+        let first_token = generation::sample(&logits_suppressed, config)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
         // Check for EOS
@@ -410,8 +418,15 @@ impl Qwen3TTS {
             offset += 1;
             last_hidden = hidden;
 
+            // Apply token suppression before sampling
+            let logits_suppressed = generation::apply_token_suppression(
+                &logits.squeeze(1)?,
+                3072,
+                config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
+            )?;
+
             // Sample semantic token
-            let next_token = generation::sample(&logits.squeeze(1)?, config)?;
+            let next_token = generation::sample(&logits_suppressed, config)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
             // Check for EOS
@@ -561,8 +576,13 @@ impl<'a> StreamingSession<'a> {
         let seq_len = hidden.dim(1)?;
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
 
-        // Sample first token
-        let first_token = generation::sample(&logits.squeeze(1)?, &config)?;
+        // Apply token suppression and sample first token
+        let logits_suppressed = generation::apply_token_suppression(
+            &logits.squeeze(1)?,
+            3072,
+            config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
+        )?;
+        let first_token = generation::sample(&logits_suppressed, &config)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
         // Check for immediate EOS
@@ -629,7 +649,13 @@ impl<'a> StreamingSession<'a> {
             self.offset += 1;
             self.last_hidden = hidden;
 
-            let next_token = generation::sample(&logits.squeeze(1)?, &self.config)?;
+            // Apply token suppression before sampling
+            let logits_suppressed = generation::apply_token_suppression(
+                &logits.squeeze(1)?,
+                3072,
+                self.config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
+            )?;
+            let next_token = generation::sample(&logits_suppressed, &self.config)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
             // Check for EOS

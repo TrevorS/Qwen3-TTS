@@ -4,7 +4,7 @@
 //! Consists of depthwise conv, LayerNorm, pointwise convs with GELU, and residual.
 
 use anyhow::Result;
-use candle_core::{Module, Tensor};
+use candle_core::{IndexOp, Module, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, VarBuilder};
 
 use super::CausalConv1d;
@@ -113,29 +113,94 @@ impl ConvNeXtBlock {
         // Depthwise causal conv
         let hidden = self.dwconv.forward(x)?;
 
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, ..5, 0)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after dwconv[:5,0] = {:?}", v);
+                }
+            }
+        }
+
         // Transpose: [B, C, T] -> [B, T, C]
         let hidden = hidden.transpose(1, 2)?;
 
         // LayerNorm
         let hidden = self.norm.forward(&hidden)?;
 
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, 0, ..5)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after norm[0,0,:5] = {:?}", v);
+                }
+            }
+        }
+
         // Pointwise conv 1 (expansion)
         let hidden = self.pwconv1.forward(&hidden)?;
+
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, 0, ..5)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after pwconv1[0,0,:5] = {:?}", v);
+                }
+            }
+        }
 
         // GELU activation (exact erf-based, matches PyTorch nn.GELU())
         let hidden = hidden.gelu_erf()?;
 
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, 0, ..5)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after gelu[0,0,:5] = {:?}", v);
+                }
+            }
+        }
+
         // Pointwise conv 2 (projection)
         let hidden = self.pwconv2.forward(&hidden)?;
 
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, 0, ..5)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after pwconv2[0,0,:5] = {:?}", v);
+                }
+            }
+        }
+
         // Gamma scaling
         let hidden = hidden.broadcast_mul(&self.gamma)?;
+
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = hidden.i((0, 0, ..5)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: after gamma[0,0,:5] = {:?}", v);
+                }
+            }
+        }
 
         // Transpose back: [B, T, C] -> [B, C, T]
         let hidden = hidden.transpose(1, 2)?;
 
         // Residual connection
-        Ok((residual + hidden)?)
+        let out = (residual + hidden)?;
+
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(h) = out.i((0, ..5, 0)) {
+                if let Ok(v) = h.to_vec1::<f32>() {
+                    eprintln!("DEBUG ConvNeXt: final output[:5,0] = {:?}", v);
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

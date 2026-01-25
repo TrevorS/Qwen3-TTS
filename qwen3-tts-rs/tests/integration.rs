@@ -274,6 +274,7 @@ mod end_to_end_mock {
             speaker_embedding: None,
             language: Some("en".to_string()),
             eos_token_id: Some(151670), // audio_end token
+            chunk_frames: 10,
         };
 
         assert_eq!(options.max_length, 512);

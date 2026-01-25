@@ -18,6 +18,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use models::talker::{Language, Speaker, TalkerConfig};
 use qwen3_tts::{generation, models, tokenizer, AudioBuffer};
 
 /// Generate reference audio with deterministic seed for comparison
@@ -71,6 +72,49 @@ struct Args {
     /// Tokenizer directory (defaults to model_dir/../tokenizer)
     #[arg(long)]
     tokenizer_dir: Option<String>,
+
+    /// Speaker name for CustomVoice (ryan, serena, vivian, aiden, etc.)
+    #[arg(long, default_value = "ryan")]
+    speaker: String,
+
+    /// Language for TTS (english, chinese, japanese, etc.)
+    #[arg(long, default_value = "english")]
+    language: String,
+
+    /// Use CustomVoice model (hidden=2048, MRoPE) instead of standard (hidden=1024)
+    #[arg(long)]
+    custom_voice: bool,
+}
+
+fn parse_speaker(name: &str) -> Result<Speaker> {
+    match name.to_lowercase().as_str() {
+        "ryan" => Ok(Speaker::Ryan),
+        "serena" => Ok(Speaker::Serena),
+        "vivian" => Ok(Speaker::Vivian),
+        "aiden" => Ok(Speaker::Aiden),
+        "uncle_fu" | "unclefu" => Ok(Speaker::UncleFu),
+        "ono_anna" | "onoanna" => Ok(Speaker::OnoAnna),
+        "sohee" => Ok(Speaker::Sohee),
+        "eric" => Ok(Speaker::Eric),
+        "dylan" => Ok(Speaker::Dylan),
+        _ => anyhow::bail!("Unknown speaker: {}", name),
+    }
+}
+
+fn parse_language(name: &str) -> Result<Language> {
+    match name.to_lowercase().as_str() {
+        "english" | "en" => Ok(Language::English),
+        "chinese" | "zh" => Ok(Language::Chinese),
+        "japanese" | "ja" => Ok(Language::Japanese),
+        "korean" | "ko" => Ok(Language::Korean),
+        "german" | "de" => Ok(Language::German),
+        "french" | "fr" => Ok(Language::French),
+        "russian" | "ru" => Ok(Language::Russian),
+        "portuguese" | "pt" => Ok(Language::Portuguese),
+        "spanish" | "es" => Ok(Language::Spanish),
+        "italian" | "it" => Ok(Language::Italian),
+        _ => anyhow::bail!("Unknown language: {}", name),
+    }
 }
 
 /// Metadata for generated audio
@@ -149,20 +193,48 @@ fn main() -> Result<()> {
     // Tokenize text
     let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
-    let input_tensor = Tensor::new(input_ids.as_slice(), &device)?.unsqueeze(0)?;
+    // Create models with appropriate config
+    let talker_config = if args.custom_voice {
+        println!("Using CustomVoice config (hidden=2048, MRoPE)");
+        TalkerConfig::custom_voice()
+    } else {
+        TalkerConfig::default()
+    };
 
-    // Create models
     println!("Creating TalkerModel...");
-    let talker = models::TalkerModel::from_weights(&weights, &device)?;
+    let talker = models::TalkerModel::from_weights_with_config(&weights, talker_config, &device)?;
 
     println!("Creating CodePredictor...");
-    let cp_config = models::CodePredictorConfig::default();
+    let cp_config = if args.custom_voice {
+        models::CodePredictorConfig::custom_voice()
+    } else {
+        models::CodePredictorConfig::default()
+    };
     let cp_weights = filter_weights(&weights, "talker.code_predictor.");
     let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
     let code_predictor = models::CodePredictor::new(cp_config, cp_vb)?;
 
     println!("Creating Decoder12Hz...");
     let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
+
+    // Parse speaker and language for CustomVoice prefill
+    let speaker = parse_speaker(&args.speaker)?;
+    let language = parse_language(&args.language)?;
+    println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
+
+    // Build trailing text embeddings:
+    //   remaining text tokens (all except first) projected + tts_eos
+    //   After trailing text is exhausted, tts_pad is used for each subsequent step
+    let trailing_text_hidden = if input_ids.len() > 1 {
+        let remaining_proj = talker.get_projected_text_embeddings(&input_ids[1..])?;
+        let tts_eos_embed = talker.get_tts_eos_embed()?;
+        Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+    } else {
+        talker.get_tts_eos_embed()?
+    };
+    let trailing_text_len = trailing_text_hidden.dim(1)?;
+    let tts_pad_embed = talker.get_tts_pad_embed()?;
+    println!("Trailing text length: {} positions", trailing_text_len);
 
     // Generate codes
     println!("\nGenerating {} frames...", num_frames);
@@ -187,50 +259,35 @@ fn main() -> Result<()> {
     // Initialize KV caches
     let mut kv_caches = talker.new_kv_caches();
 
-    // Prefill with text
-    let (hidden, logits) = talker.prefill(&input_tensor, &mut kv_caches)?;
-    let mut offset = input_tensor.dim(1)?;
+    // Prefill with CustomVoice format:
+    //   [role_prefix (im_start, assistant, newline)]
+    //   [tts_pad×5 + tts_bos ADDED with codec_control (think, think_bos, lang, think_eos, speaker, pad)]
+    //   [first_text_proj + codec_bos]
+    let (hidden, logits) =
+        talker.prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+    let prefill_len = hidden.dim(1)?;
+    let mut offset = prefill_len;
+    println!("Prefill length: {} positions", prefill_len);
 
-    // Get last hidden state
-    let seq_len = hidden.dim(1)?;
-    let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+    // Get last hidden state (for code predictor input)
+    let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-    // Sample first semantic token
-    let first_token = generation::sample(&logits.squeeze(1)?, &gen_config)?;
-    let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-    println!("First semantic token: {}", first_token_id);
+    // Apply token suppression and sample first semantic token
+    // Suppress tokens 2048-3071 (vocab_size=3072, codebook_size=2048)
+    let logits_suppressed = generation::apply_token_suppression(&logits.squeeze(1)?, 3072, 151670)?;
+    let first_token = generation::sample(&logits_suppressed, &gen_config)?;
+    let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+    println!("First semantic token: {}", semantic_token);
 
     // Collect all codes
     let mut all_codes: Vec<Vec<u32>> = Vec::new();
 
-    // First frame
-    let semantic_embed = talker.get_codec_embedding(first_token_id)?;
-    let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+    // Generation loop: for each frame, generate acoustic codes, then prepare next step
+    for frame_idx in 0..num_frames {
+        // Get semantic token embedding
+        let semantic_embed = talker.get_codec_embedding(semantic_token)?;
 
-    println!(
-        "Frame 0: semantic={}, acoustics={:?}...",
-        first_token_id,
-        &acoustic_codes[..3.min(acoustic_codes.len())]
-    );
-
-    let mut frame_codes = vec![first_token_id];
-    frame_codes.extend(acoustic_codes);
-    all_codes.push(frame_codes);
-    progress.inc(1);
-
-    // Generate remaining frames
-    for frame_idx in 1..num_frames {
-        let prev_token = all_codes.last().unwrap()[0];
-        let (hidden, logits) = talker.generate_step(prev_token, &mut kv_caches, offset)?;
-        offset += 1;
-        last_hidden = hidden;
-
-        // Sample semantic token
-        let next_token = generation::sample(&logits.squeeze(1)?, &gen_config)?;
-        let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-        // Generate acoustic tokens
-        let semantic_embed = talker.get_codec_embedding(next_token_id)?;
+        // Generate 15 acoustic codes using code predictor
         let acoustic_codes =
             code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
 
@@ -238,17 +295,49 @@ fn main() -> Result<()> {
             println!(
                 "Frame {}: semantic={}, acoustics={:?}...",
                 frame_idx,
-                next_token_id,
+                semantic_token,
                 &acoustic_codes[..3.min(acoustic_codes.len())]
             );
         } else if frame_idx == 5 {
             println!("...");
         }
 
-        let mut frame_codes = vec![next_token_id];
-        frame_codes.extend(acoustic_codes);
+        // Save frame codes [semantic, acoustic_0, ..., acoustic_14]
+        let mut frame_codes = vec![semantic_token];
+        frame_codes.extend(&acoustic_codes);
         all_codes.push(frame_codes);
         progress.inc(1);
+
+        // If this is the last frame, we're done
+        if frame_idx == num_frames - 1 {
+            break;
+        }
+
+        // Build input for next talker step:
+        // Sum all 16 code embeddings (residual VQ pattern: semantic + 15 acoustic)
+        let acoustic_embed_sum =
+            code_predictor.get_acoustic_embeddings_sum(&acoustic_codes, &device)?;
+        let summed = semantic_embed.add(&acoustic_embed_sum)?;
+
+        // Add trailing text embedding (or tts_pad if trailing text is exhausted)
+        let text_addition = if frame_idx < trailing_text_len {
+            trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
+        } else {
+            tts_pad_embed.clone()
+        };
+        let step_input = summed.add(&text_addition)?;
+
+        // Run through talker to get next hidden state and logits
+        let (h, new_logits) =
+            talker.generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
+        offset += 1;
+        last_hidden = h;
+
+        // Sample next semantic token
+        let logits_suppressed =
+            generation::apply_token_suppression(&new_logits.squeeze(1)?, 3072, 151670)?;
+        let next_token = generation::sample(&logits_suppressed, &gen_config)?;
+        semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
     }
 
     progress.finish_with_message("Done generating codes");

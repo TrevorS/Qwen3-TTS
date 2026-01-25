@@ -260,17 +260,12 @@ impl CodePredictor {
         Ok(self.lm_heads[group_idx].forward(&pos_hidden)?)
     }
 
-    /// Generate all 15 acoustic tokens given talker hidden state and semantic token
+    /// Generate all 15 acoustic tokens autoregressively
     ///
-    /// The code predictor uses autoregressive decoding: each acoustic token
-    /// depends on the previous one.
-    ///
-    /// Flow:
-    /// 1. Prefill: `[talker_hidden, semantic_embed]` → `lm_head[0]` → acoustic_0
-    /// 2. Step 1: embed(acoustic_0) via `codec_embedding[0]` → `lm_head[1]` → acoustic_1
-    /// 3. Step 2: embed(acoustic_1) via `codec_embedding[1]` → `lm_head[2]` → acoustic_2
-    ///
-    /// ...and so on for all 15 acoustic tokens.
+    /// Each acoustic code is predicted conditioned on the talker hidden state,
+    /// the semantic token embedding, and all previously generated acoustic codes.
+    /// This matches the official Qwen3-TTS architecture where the code predictor
+    /// uses KV caching for sequential generation.
     ///
     /// # Arguments
     /// * `talker_hidden` - Hidden state from talker model, shape [batch, 1, hidden]
@@ -286,13 +281,7 @@ impl CodePredictor {
         let device = talker_hidden.device();
         let num_acoustic = self.config.num_code_groups - 1; // 15 acoustic codes
 
-        // Create KV caches for autoregressive generation
-        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
-            .map(|_| KVCache::new())
-            .collect();
-
-        // === Prefill ===
-        // Input: [talker_hidden, semantic_embed] → shape [1, 2, embed_dim]
+        // Step 1: Prefill with [talker_hidden, semantic_embed]
         let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
 
         // Apply projection if needed (CustomVoice: 2048 -> 1024)
@@ -305,29 +294,33 @@ impl CodePredictor {
         let seq_len = input.dim(1)?;
         let mask = self.create_causal_mask(seq_len, device)?;
 
+        // Run prefill through all 5 transformer layers with KV cache
+        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
+            .map(|_| KVCache::new())
+            .collect();
+
         let mut hidden = input;
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
         }
         hidden = self.norm.forward(&hidden)?;
 
-        // First acoustic code from lm_head[0] at last position
-        let hidden_last = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.lm_heads[0].forward(&hidden_last)?;
-        let first_code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
+        // Step 2: Predict first acoustic code from last position
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.lm_heads[0].forward(&last_hidden)?;
+        let code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
 
         let mut codes = Vec::with_capacity(num_acoustic);
-        codes.push(first_code);
+        codes.push(code);
 
-        // === Autoregressive generation for remaining 14 acoustic codes ===
-        let mut prev_code = first_code;
-        let mut offset = seq_len; // Current position for KV cache
-
+        // Step 3: Autoregressively generate remaining 14 codes
+        let mut offset = seq_len;
         for group_idx in 1..num_acoustic {
-            // Embed previous code with codec_embedding[group_idx - 1]
+            // Embed previous code using the previous group's embedding
+            let prev_code = codes[group_idx - 1];
             let code_tensor = Tensor::new(&[prev_code], device)?;
             let code_embed = self.codec_embeddings[group_idx - 1].forward(&code_tensor)?;
-            let code_embed = code_embed.unsqueeze(0)?; // [1, 1, embed_dim]
+            let code_embed = code_embed.unsqueeze(0)?; // [1, 1, codec_embed_dim]
 
             // Apply projection if needed
             let code_embed = if let Some(proj) = &self.small_to_mtp_projection {
@@ -336,20 +329,22 @@ impl CodePredictor {
                 code_embed
             };
 
-            // Forward through layers (single token, using KV cache)
-            let mut hidden = code_embed;
+            // Create mask for single token attending to all previous positions
+            let total_len = offset + 1;
+            let mask_data: Vec<f32> = (0..total_len).map(|_| 0.0f32).collect();
+            let mask = Tensor::from_vec(mask_data, (1, 1, 1, total_len), device)?;
+
+            // Run through layers with KV cache
+            let mut h = code_embed;
             for (i, layer) in self.layers.iter().enumerate() {
-                hidden =
-                    layer.forward(&hidden, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
+                h = layer.forward(&h, &self.rope, Some(&mask), Some(&mut kv_caches[i]), offset)?;
             }
-            hidden = self.norm.forward(&hidden)?;
+            h = self.norm.forward(&h)?;
 
-            // Get next acoustic code from lm_head[group_idx]
-            let logits = self.lm_heads[group_idx].forward(&hidden)?;
+            // Predict next code
+            let logits = self.lm_heads[group_idx].forward(&h)?;
             let next_code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
-
             codes.push(next_code);
-            prev_code = next_code;
             offset += 1;
         }
 

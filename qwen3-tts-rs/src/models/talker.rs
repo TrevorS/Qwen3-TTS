@@ -627,8 +627,22 @@ impl TalkerModel {
         let text_embed = self.text_embedding.index_select(&input_ids_flat, 0)?;
         let text_embed = text_embed.reshape((1, seq_len, self.config.text_embed_dim))?;
 
+        // Debug: print embedding values
+        #[cfg(debug_assertions)]
+        {
+            let embed_vec: Vec<f32> = text_embed.i((0, 0, ..5))?.to_vec1()?;
+            eprintln!("DEBUG TALKER: text_embed[0,0,:5] = {:?}", embed_vec);
+        }
+
         // Project to hidden dimension
         let mut hidden = self.text_projection.forward(&text_embed)?;
+
+        // Debug: print projected values
+        #[cfg(debug_assertions)]
+        {
+            let proj_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
+            eprintln!("DEBUG TALKER: after_proj[0,0,:5] = {:?}", proj_vec);
+        }
 
         // Create causal mask
         let mask = self.create_causal_mask(seq_len, 0)?;
@@ -644,6 +658,35 @@ impl TalkerModel {
         // Get logits for last position
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
         let logits = self.linear(&last_hidden, &self.codec_head, None)?;
+
+        // Debug: print logits for first few tokens
+        #[cfg(debug_assertions)]
+        {
+            let logits_flat: Vec<f32> = logits.squeeze(0)?.squeeze(0)?.to_vec1()?;
+            let argmax = logits_flat
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i);
+            eprintln!(
+                "DEBUG TALKER: logits shape = {:?}, argmax = {:?}",
+                logits.shape(),
+                argmax
+            );
+            eprintln!(
+                "DEBUG TALKER: logits[0:5] = {:?}",
+                &logits_flat[..5.min(logits_flat.len())]
+            );
+            // Print logits around token 439 (Rust result) and 1501 (Python result)
+            eprintln!(
+                "DEBUG TALKER: logits[438:442] = {:?}",
+                &logits_flat[438..442.min(logits_flat.len())]
+            );
+            eprintln!(
+                "DEBUG TALKER: logits[1500:1504] = {:?}",
+                &logits_flat[1500..1504.min(logits_flat.len())]
+            );
+        }
 
         Ok((hidden, logits))
     }
@@ -773,8 +816,18 @@ impl TalkerModel {
         let codec_len = 4 + 1 + 2;
         let mut offset = chatml_len + codec_len;
 
+        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
+        // vocab_size=3072, codebook_size=2048
+        // EOS token (151670) is outside this range anyway, so use a default
+        let eos_for_suppression = config.eos_token_id.unwrap_or(151670);
+        let logits_suppressed = crate::generation::apply_token_suppression(
+            &logits.squeeze(1)?,
+            3072,
+            eos_for_suppression,
+        )?;
+
         // Sample first token
-        let first_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+        let first_token = crate::generation::sample(&logits_suppressed, config)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
         let mut generated = vec![first_token_id];
@@ -792,8 +845,15 @@ impl TalkerModel {
             let (_hidden, logits) = self.generate_step(prev_token, &mut kv_caches, offset)?;
             offset += 1;
 
+            // Apply token suppression before sampling
+            let logits_suppressed = crate::generation::apply_token_suppression(
+                &logits.squeeze(1)?,
+                3072,
+                eos_for_suppression,
+            )?;
+
             // Sample next token
-            let next_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+            let next_token = crate::generation::sample(&logits_suppressed, config)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
             generated.push(next_token_id);
@@ -960,8 +1020,17 @@ impl TalkerModel {
         let (_hidden, logits) = self.prefill(input_ids, &mut kv_caches)?;
         let mut offset = input_ids.dim(1)?;
 
+        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
+        // vocab_size=3072, codebook_size=2048
+        let eos_for_suppression = config.eos_token_id.unwrap_or(151670);
+        let logits_suppressed = crate::generation::apply_token_suppression(
+            &logits.squeeze(1)?,
+            3072,
+            eos_for_suppression,
+        )?;
+
         // Sample first token
-        let first_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+        let first_token = crate::generation::sample(&logits_suppressed, config)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
         let mut generated = vec![first_token_id];
@@ -979,8 +1048,15 @@ impl TalkerModel {
             let (_hidden, logits) = self.generate_step(prev_token, &mut kv_caches, offset)?;
             offset += 1;
 
+            // Apply token suppression before sampling
+            let logits_suppressed = crate::generation::apply_token_suppression(
+                &logits.squeeze(1)?,
+                3072,
+                eos_for_suppression,
+            )?;
+
             // Sample next token
-            let next_token = crate::generation::sample(&logits.squeeze(1)?, config)?;
+            let next_token = crate::generation::sample(&logits_suppressed, config)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
             generated.push(next_token_id);
