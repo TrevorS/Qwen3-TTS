@@ -29,7 +29,7 @@ Component-by-component validation of the Rust implementation against Python refe
 | Full 12Hz Decoder | ✅ Pass | 3e-6 | Quantizer → audio |
 | End-to-End Pipeline | ✅ Pass | 2e-6 | Text → audio |
 
-**Test Totals:** 179 unit tests + 29 reference validation tests = 208 tests passing
+**Test Totals:** 164 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests = 234 passing
 
 ## Architecture Details
 

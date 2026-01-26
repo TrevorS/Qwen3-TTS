@@ -23,9 +23,20 @@ Pure Rust implementation of Qwen3-TTS using Candle ML framework. The implementat
 | Full 12Hz Decoder | ✅ | 3e-6 |
 | End-to-end pipeline | ✅ | 2e-6 |
 
-**Test counts:** 179 unit tests + 29 reference validation tests
+**Test counts:** 165 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests
 
 ## Recent Changes
+
+### Deep cleanup pass: VarBuilder conversion & dead code removal
+- Converted `TalkerModel` from raw `HashMap<String, Tensor>` lookups to `VarBuilder` + typed candle_nn layers (`Embedding`, `Linear`, `RmsNorm`, `DecoderLayer`)
+- Deleted `TalkerDecoderLayer` (~240 lines) — now reuses `DecoderLayer` from `transformer.rs`
+- Moved `RoPEType` enum to `transformer.rs`, updated `DecoderLayer::forward()` and `CodePredictor` to use it
+- Removed 5 dead methods from `TalkerModel`: `generate_custom_voice()`, `generate()`, `get_last_hidden()`, `generate_step()`, `generate_step_with_text()`
+- Added config auto-detection in `TalkerModel::from_weights()` based on norm weight shape (1024 → Base, 2048 → CustomVoice)
+- Removed dead `AudioCodec` wrapper, `AudioCodecConfig`, and `presets` module
+- Removed unused `SpeakerEncoder` re-export from `models/mod.rs`
+- Cleaned up underscore-prefixed fields (`_config`, `_device`) from `CodecDecoder`, `SpeakerEncoder`, `Decoder12Hz`
+- Fixed README streaming example and CLI tools section
 
 ### Dead code cleanup & public API wiring
 - Deleted stale binaries: `main.rs`, `tts_generate.rs`, `custom_voice_tts.rs`
@@ -92,9 +103,10 @@ src/
 ├── audio/              # Audio I/O, mel spectrograms, resampling
 ├── generation/         # Token sampling and generation config
 ├── models/
-│   ├── transformer.rs  # Shared building blocks (KVCache, RoPE, Attention, MLP, DecoderLayer)
+│   ├── transformer.rs  # Shared building blocks (KVCache, RoPE, RoPEType, Attention, MLP, DecoderLayer)
 │   ├── talker.rs       # TalkerModel (semantic token generation)
 │   ├── code_predictor.rs # Acoustic token predictor
+│   ├── config.rs       # Model configurations (Qwen3TTSConfig)
 │   ├── speaker.rs      # Speaker encoder (ECAPA-TDNN)
 │   └── codec/          # Audio decoder (12Hz)
 └── tokenizer/          # Text tokenizer
@@ -114,15 +126,13 @@ let left_trim = 0;  // NOT kernel_size / 2
 ```
 
 ### Linear for 3D Tensors
-Candle doesn't auto-broadcast 3D @ 2D:
+Candle's `candle_nn::Linear` handles 3D inputs natively. For modules still using raw
+weight tensors (e.g. `Decoder12Hz`), a manual reshape is needed:
 ```rust
-fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+fn linear_3d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let (batch, seq, features) = x.dims3()?;
     let x_2d = x.reshape((batch * seq, features))?;
     let out_2d = x_2d.matmul(&weight.t()?)?;
     out_2d.reshape((batch, seq, out_2d.dim(1)?))
 }
 ```
-
-### RoPE Duplication
-Duplicate cos/sin with `.repeat(1, 2)` for full head_dim coverage.

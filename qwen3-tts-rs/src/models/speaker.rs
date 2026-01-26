@@ -148,7 +148,6 @@ impl AttentiveStatisticsPooling {
 
 /// Simplified ECAPA-TDNN speaker encoder
 pub struct SpeakerEncoder {
-    _config: SpeakerEncoderConfig,
     mel_extractor: MelSpectrogram,
 
     // Network layers
@@ -187,7 +186,6 @@ impl SpeakerEncoder {
             asp: AttentiveStatisticsPooling::new(config.hidden_dim, vb.pp("asp"))?,
             fc: linear(config.hidden_dim * 2, config.embed_dim, vb.pp("fc"))?,
             mel_extractor,
-            _config: config,
             device,
         })
     }

@@ -1,7 +1,7 @@
 //! Neural network models for Qwen3-TTS
 //!
 //! This module contains:
-//! - `transformer`: Shared building blocks (KVCache, RoPE, Attention, MLP, DecoderLayer)
+//! - `transformer`: Shared building blocks (KVCache, RoPE, RoPEType, Attention, MLP, DecoderLayer)
 //! - `talker`: TalkerModel for semantic token generation
 //! - `code_predictor`: Acoustic token predictor
 //! - `speaker`: Speaker encoder (ECAPA-TDNN)
@@ -17,6 +17,5 @@ pub mod transformer;
 
 pub use code_predictor::{CodePredictor, CodePredictorConfig};
 pub use config::Qwen3TTSConfig;
-pub use speaker::SpeakerEncoder;
 pub use talker::{TalkerConfig, TalkerModel};
-pub use transformer::{KVCache, MRoPE, RotaryEmbedding};
+pub use transformer::{KVCache, MRoPE, RoPEType, RotaryEmbedding};

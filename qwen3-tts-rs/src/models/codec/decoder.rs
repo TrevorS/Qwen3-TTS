@@ -3,7 +3,7 @@
 //! Converts discrete codec tokens back to audio waveforms.
 
 use anyhow::Result;
-use candle_core::{Device, Module, Tensor, D};
+use candle_core::{Module, Tensor, D};
 use candle_nn::{
     conv1d, conv_transpose1d, linear, rms_norm, Conv1d, Conv1dConfig, ConvTranspose1d,
     ConvTranspose1dConfig, Linear, RmsNorm, VarBuilder,
@@ -229,7 +229,6 @@ impl DecoderTransformerLayer {
 
 /// Main codec decoder
 pub struct CodecDecoder {
-    _config: DecoderConfig,
     /// Vector quantizer for codebook lookups
     quantizer: ResidualVectorQuantizer,
     /// Input projection from codebook embeddings
@@ -244,14 +243,11 @@ pub struct CodecDecoder {
     residual_blocks: Vec<Vec<ResidualBlock>>,
     /// Final convolution to audio
     final_conv: Conv1d,
-    _device: Device,
 }
 
 impl CodecDecoder {
     /// Create new codec decoder
     pub fn new(config: DecoderConfig, vb: VarBuilder) -> Result<Self> {
-        let device = vb.device().clone();
-
         // Create quantizer
         let quantizer = ResidualVectorQuantizer::new(
             config.num_quantizers,
@@ -319,7 +315,6 @@ impl CodecDecoder {
         )?;
 
         Ok(Self {
-            _config: config,
             quantizer,
             input_proj,
             pre_transformer,
@@ -327,7 +322,6 @@ impl CodecDecoder {
             upsample_blocks,
             residual_blocks,
             final_conv,
-            _device: device,
         })
     }
 
@@ -374,7 +368,7 @@ impl CodecDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
     fn create_mock_vb(device: &Device) -> VarBuilder<'static> {

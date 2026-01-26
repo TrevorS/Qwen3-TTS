@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
 For low-latency applications, use streaming mode which yields audio in chunks:
 
 ```rust
-use qwen3_tts::{Qwen3TTS, SynthesisOptions, auto_device};
+use qwen3_tts::{Qwen3TTS, Speaker, Language, SynthesisOptions, auto_device};
 
 fn main() -> anyhow::Result<()> {
     let device = auto_device()?;
@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    for chunk in model.synthesize_streaming("Hello, world!", options)? {
+    for chunk in model.synthesize_streaming("Hello, world!", Speaker::Ryan, Language::English, options)? {
         let audio = chunk?;
         // Play or stream this chunk (each ~800ms)
         println!("Got {} samples", audio.samples.len());
@@ -146,17 +146,14 @@ Text → TalkerModel → Semantic Token → CodePredictor → [16 tokens] → De
 
 ## CLI Tools
 
-Build and run the CLI tools with:
+Build and run the CLI tool with:
 
 ```bash
-# Basic TTS generation
-cargo run --features cli --bin tts_generate -- --text "Hello, world!" --output output.wav
+# Generate audio with specific seed (for reproducibility)
+cargo run --release --features cli --bin generate_audio -- --text "Hello" --seed 42 --frames 25
 
-# Generate with specific seed (for reproducibility)
-cargo run --features cli --bin generate_audio -- --text "Hello" --seed 42 --frames 25
-
-# CustomVoice generation
-cargo run --features cli --bin custom_voice_tts -- --text "Hello" --speaker ryan
+# CustomVoice generation with speaker selection
+cargo run --release --features cli --bin generate_audio -- --text "Hello" --custom-voice --speaker ryan
 ```
 
 ## Test Data

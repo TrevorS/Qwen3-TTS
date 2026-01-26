@@ -44,14 +44,6 @@ fn load_f32_bin(path: &str) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn tensor_stats(t: &Tensor) -> String {
-    let mean = t.mean_all().unwrap().to_vec0::<f32>().unwrap();
-    let t_sq = t.sqr().unwrap();
-    let var = t_sq.mean_all().unwrap().to_vec0::<f32>().unwrap() - mean * mean;
-    let std = var.sqrt();
-    format!("mean={:.6}, std={:.6}", mean, std)
-}
-
 fn compare_with_python(rust_tensor: &Tensor, python_file: &str, stage_name: &str) -> Result<f32> {
     let rust_flat: Vec<f32> = rust_tensor.flatten_all()?.to_vec1()?;
     let python_flat = load_f32_bin(python_file)?;

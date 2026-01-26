@@ -13,7 +13,7 @@ use candle_core::{IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3TTSConfig;
-use super::transformer::{DecoderLayer, KVCache, RotaryEmbedding};
+use super::transformer::{DecoderLayer, KVCache, RoPEType, RotaryEmbedding};
 
 /// Code predictor configuration
 #[derive(Debug, Clone)]
@@ -131,7 +131,7 @@ pub struct CodePredictor {
     /// LM heads for each acoustic group (0-14 for groups 2-16)
     lm_heads: Vec<Linear>,
     /// Rotary embeddings
-    rope: RotaryEmbedding,
+    rope: RoPEType,
     /// Configuration
     config: CodePredictorConfig,
 }
@@ -188,12 +188,12 @@ impl CodePredictor {
         }
 
         // Rotary embeddings
-        let rope = RotaryEmbedding::new(
+        let rope = RoPEType::Standard(RotaryEmbedding::new(
             config.head_dim,
             1024, // Max sequence length for code predictor
             config.rope_theta,
             vb.device(),
-        )?;
+        )?);
 
         Ok(Self {
             codec_embeddings,

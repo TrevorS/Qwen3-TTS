@@ -141,7 +141,7 @@ mod tokenizer_tests {
 mod model_tests {
     use super::*;
     use qwen3_tts::models::{
-        codec::{presets, CodecDecoder, DecoderConfig},
+        codec::{CodecDecoder, DecoderConfig},
         Qwen3TTSConfig,
     };
 
@@ -168,17 +168,6 @@ mod model_tests {
             .collect();
 
         assert_eq!(kv_caches.len(), config.num_hidden_layers);
-    }
-
-    #[test]
-    fn test_codec_preset_configs() {
-        let config_12hz = presets::codec_12hz();
-        let config_25hz = presets::codec_25hz();
-
-        assert_eq!(config_12hz.codec_type, "12hz");
-        assert_eq!(config_25hz.codec_type, "25hz");
-        assert!((config_12hz.frame_rate - 12.5).abs() < 1e-6);
-        assert!((config_25hz.frame_rate - 25.0).abs() < 1e-6);
     }
 
     #[test]

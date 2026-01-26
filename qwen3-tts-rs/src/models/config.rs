@@ -211,76 +211,6 @@ impl Qwen3TTSConfig {
     }
 }
 
-/// Audio codec configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioCodecConfig {
-    /// Codec type: "12hz" or "25hz"
-    #[serde(default = "default_codec_type")]
-    pub codec_type: String,
-
-    /// Sample rate
-    #[serde(default = "default_sample_rate")]
-    pub sample_rate: u32,
-
-    /// Number of quantizers
-    #[serde(default = "default_num_quantizers")]
-    pub num_quantizers: usize,
-
-    /// Codebook size
-    #[serde(default = "default_codebook_size")]
-    pub codebook_size: usize,
-
-    /// Frame rate (Hz)
-    #[serde(default = "default_frame_rate")]
-    pub frame_rate: f32,
-
-    /// Decoder hidden size
-    #[serde(default = "default_decoder_hidden_size")]
-    pub decoder_hidden_size: usize,
-
-    /// Decoder transformer layers
-    #[serde(default = "default_decoder_num_layers")]
-    pub decoder_num_layers: usize,
-}
-
-fn default_codec_type() -> String {
-    "12hz".to_string()
-}
-
-fn default_sample_rate() -> u32 {
-    24000
-}
-
-fn default_num_quantizers() -> usize {
-    16
-}
-
-fn default_frame_rate() -> f32 {
-    12.5
-}
-
-fn default_decoder_hidden_size() -> usize {
-    1024
-}
-
-fn default_decoder_num_layers() -> usize {
-    8
-}
-
-impl Default for AudioCodecConfig {
-    fn default() -> Self {
-        Self {
-            codec_type: default_codec_type(),
-            sample_rate: default_sample_rate(),
-            num_quantizers: default_num_quantizers(),
-            codebook_size: default_codebook_size(),
-            frame_rate: default_frame_rate(),
-            decoder_hidden_size: default_decoder_hidden_size(),
-            decoder_num_layers: default_decoder_num_layers(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,18 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_codec_config_default() {
-        let config = AudioCodecConfig::default();
-        assert_eq!(config.codec_type, "12hz");
-        assert_eq!(config.sample_rate, 24000);
-        assert_eq!(config.num_quantizers, 16);
-        assert_eq!(config.codebook_size, 2048);
-        assert!((config.frame_rate - 12.5).abs() < 1e-6);
-        assert_eq!(config.decoder_hidden_size, 1024);
-        assert_eq!(config.decoder_num_layers, 8);
-    }
-
-    #[test]
     fn test_config_serialization() {
         let config = Qwen3TTSConfig::default();
         let json = serde_json::to_string(&config).unwrap();
@@ -386,15 +304,6 @@ mod tests {
         assert_eq!(config.hidden_size, 512);
         assert_eq!(config.num_attention_heads, 8);
         assert_eq!(config.num_key_value_heads, Some(4));
-    }
-
-    #[test]
-    fn test_audio_codec_config_serialization() {
-        let config = AudioCodecConfig::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: AudioCodecConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.codec_type, config.codec_type);
-        assert_eq!(parsed.sample_rate, config.sample_rate);
     }
 
     #[test]

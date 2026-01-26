@@ -4,7 +4,9 @@
 //! Consists of depthwise conv, LayerNorm, pointwise convs with GELU, and residual.
 
 use anyhow::Result;
-use candle_core::{IndexOp, Module, Tensor};
+#[cfg(debug_assertions)]
+use candle_core::IndexOp;
+use candle_core::{Module, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, VarBuilder};
 
 use super::CausalConv1d;

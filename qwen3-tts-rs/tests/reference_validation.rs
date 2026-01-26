@@ -1020,7 +1020,7 @@ fn test_model_module_matches_reference() -> Result<()> {
     // This test uses the actual qwen3_tts model module to verify it matches Python
     use candle_nn::VarBuilder;
     use qwen3_tts::models::config::Qwen3TTSConfig;
-    use qwen3_tts::models::transformer::{DecoderLayer, RotaryEmbedding};
+    use qwen3_tts::models::transformer::{DecoderLayer, RoPEType, RotaryEmbedding};
 
     if !reference_available() {
         return Ok(());
@@ -1057,7 +1057,12 @@ fn test_model_module_matches_reference() -> Result<()> {
     let layer = DecoderLayer::new(&config, layer_vb)?;
 
     // Create RoPE using config.head_dim()
-    let rope = RotaryEmbedding::new(config.head_dim(), 512, config.rope_theta, &device)?;
+    let rope = RoPEType::Standard(RotaryEmbedding::new(
+        config.head_dim(),
+        512,
+        config.rope_theta,
+        &device,
+    )?);
 
     // Get projected input (matches what Python exports)
     let projected = load_reference("projected.bin", &[1, 5, 1024], &device)?;
@@ -3127,7 +3132,9 @@ fn test_autoregressive_generation() -> Result<()> {
     // Generate remaining frames
     for frame_idx in 1..5 {
         let prev_token = all_codes.last().unwrap()[0];
-        let (hidden, logits) = talker.generate_step(prev_token, &mut talker_kv_caches, offset)?;
+        let prev_embed = talker.get_codec_embedding(prev_token)?;
+        let (hidden, logits) =
+            talker.generate_step_with_embed(&prev_embed, &mut talker_kv_caches, offset)?;
         offset += 1;
         last_hidden = hidden;
 

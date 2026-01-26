@@ -4,7 +4,7 @@
 //! Uses the Mimi-based architecture with BigVGAN-style upsampling.
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor, D};
 use std::collections::HashMap;
 
 use super::{CausalConv1d, CausalTransConv1d, ConvNeXtBlock, DecoderBlock, SnakeBeta};
@@ -186,12 +186,6 @@ impl Decoder12Hz {
         weights: &HashMap<String, Tensor>,
         config: Decoder12HzConfig,
     ) -> Result<Self> {
-        let _device = weights
-            .values()
-            .next()
-            .map(|t| t.device().clone())
-            .unwrap_or(Device::Cpu);
-
         // Load codebooks - normalize by cluster_usage as per official implementation
         // embedding = embedding_sum / cluster_usage
         let first_embedding_sum = weights
@@ -705,6 +699,7 @@ impl Decoder12Hz {
         }
 
         // 5. Upsample stages
+        #[allow(unused_variables, clippy::unused_enumerate_index)]
         for (i, stage) in self.upsample_stages.iter().enumerate() {
             // Save trans_conv output for debugging
             #[cfg(debug_assertions)]
@@ -775,6 +770,7 @@ impl Decoder12Hz {
         }
 
         // 7. Decoder blocks
+        #[allow(unused_variables, clippy::unused_enumerate_index)]
         for (i, block) in self.decoder_blocks.iter().enumerate() {
             hidden = block.forward(&hidden)?;
             #[cfg(debug_assertions)]
@@ -908,7 +904,7 @@ impl Decoder12Hz {
     }
 
     /// Run a single transformer layer
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_variables)]
     fn run_layer(
         &self,
         hidden: &Tensor,

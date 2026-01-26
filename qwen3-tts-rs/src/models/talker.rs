@@ -17,11 +17,12 @@
 //! - Codec BOS: `[codec_pad, codec_bos]`
 
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 use std::collections::HashMap;
 
-use super::transformer::{KVCache, MRoPE, RotaryEmbedding};
-use crate::generation::GenerationConfig;
+use super::config::Qwen3TTSConfig;
+use super::transformer::{DecoderLayer, KVCache, MRoPE, RoPEType, RotaryEmbedding};
 
 /// ChatML special token IDs
 pub mod special_tokens {
@@ -201,106 +202,68 @@ impl TalkerConfig {
             mrope_section: Some([24, 20, 20]), // CustomVoice uses MRoPE
         }
     }
+
+    /// Convert to a Qwen3TTSConfig for building DecoderLayers
+    pub fn to_layer_config(&self) -> Qwen3TTSConfig {
+        Qwen3TTSConfig {
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: Some(self.num_key_value_heads),
+            head_dim_override: Some(self.head_dim),
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            ..Default::default()
+        }
+    }
 }
 
 /// Text projection with SwiGLU activation
 /// Maps text embeddings (2048) to hidden dimension (1024)
 pub struct TextProjection {
-    fc1_weight: Tensor,
-    fc1_bias: Tensor,
-    fc2_weight: Tensor,
-    fc2_bias: Tensor,
+    fc1: Linear,
+    fc2: Linear,
 }
 
 impl TextProjection {
-    /// Create from weight tensors
-    pub fn from_weights(weights: &HashMap<String, Tensor>) -> Result<Self> {
-        let fc1_weight = weights
-            .get("talker.text_projection.linear_fc1.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing text_projection.linear_fc1.weight"))?
-            .clone();
-        let fc1_bias = weights
-            .get("talker.text_projection.linear_fc1.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing text_projection.linear_fc1.bias"))?
-            .clone();
-        let fc2_weight = weights
-            .get("talker.text_projection.linear_fc2.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing text_projection.linear_fc2.weight"))?
-            .clone();
-        let fc2_bias = weights
-            .get("talker.text_projection.linear_fc2.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing text_projection.linear_fc2.bias"))?
-            .clone();
-
-        Ok(Self {
-            fc1_weight,
-            fc1_bias,
-            fc2_weight,
-            fc2_bias,
-        })
+    /// Create from VarBuilder with config dimensions
+    pub fn new(config: &TalkerConfig, vb: VarBuilder) -> Result<Self> {
+        let fc1 = candle_nn::linear(
+            config.text_embed_dim,
+            config.text_proj_intermediate,
+            vb.pp("linear_fc1"),
+        )?;
+        let fc2 = candle_nn::linear(
+            config.text_proj_intermediate,
+            config.hidden_size,
+            vb.pp("linear_fc2"),
+        )?;
+        Ok(Self { fc1, fc2 })
     }
 
     /// Forward pass: fc1 -> silu -> fc2
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let hidden = self.linear(x, &self.fc1_weight, Some(&self.fc1_bias))?;
+        let hidden = self.fc1.forward(x)?;
         let hidden = candle_nn::ops::silu(&hidden)?;
-        self.linear(&hidden, &self.fc2_weight, Some(&self.fc2_bias))
-    }
-
-    fn linear(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        let dims = x.dims();
-        if dims.len() == 3 {
-            let (batch, seq, _features) = (dims[0], dims[1], dims[2]);
-            let x_2d = x.reshape((batch * seq, x.dim(2)?))?;
-            let out_2d = x_2d.matmul(&weight.t()?)?;
-            let out_3d = out_2d.reshape((batch, seq, out_2d.dim(1)?))?;
-            match bias {
-                Some(b) => Ok(out_3d.broadcast_add(b)?),
-                None => Ok(out_3d),
-            }
-        } else {
-            let out = x.matmul(&weight.t()?)?;
-            match bias {
-                Some(b) => Ok(out.broadcast_add(b)?),
-                None => Ok(out),
-            }
-        }
-    }
-}
-
-/// Either standard RoPE or MRoPE (multimodal)
-pub enum RoPEType {
-    Standard(RotaryEmbedding),
-    Multimodal(MRoPE),
-}
-
-impl RoPEType {
-    /// Apply rotary embedding to Q and K tensors
-    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        match self {
-            RoPEType::Standard(rope) => rope.apply(q, k, offset),
-            RoPEType::Multimodal(mrope) => {
-                let seq_len = q.dim(2)?;
-                mrope.apply(q, k, offset, seq_len)
-            }
-        }
+        Ok(self.fc2.forward(&hidden)?)
     }
 }
 
 /// TalkerModel for autoregressive semantic token generation
 pub struct TalkerModel {
     /// Text embedding [text_vocab_size, text_embed_dim]
-    text_embedding: Tensor,
+    text_embedding: Embedding,
     /// Text projection (2048 -> 1024)
     text_projection: TextProjection,
     /// Codec embedding [codec_vocab_size, hidden_size]
-    codec_embedding: Tensor,
+    codec_embedding: Embedding,
     /// Transformer decoder layers
-    layers: Vec<TalkerDecoderLayer>,
-    /// Final RMS norm weight
-    norm_weight: Tensor,
-    /// Codec head [codec_vocab_size, hidden_size]
-    codec_head: Tensor,
+    layers: Vec<DecoderLayer>,
+    /// Final RMS norm
+    norm: RmsNorm,
+    /// Codec head (hidden_size -> codec_vocab_size)
+    codec_head: Linear,
     /// Rotary position embedding (standard or MRoPE)
     rope: RoPEType,
     /// Configuration
@@ -309,277 +272,57 @@ pub struct TalkerModel {
     device: Device,
 }
 
-/// Simplified decoder layer that works directly with weight tensors
-/// (avoids the VarBuilder complexity)
-pub struct TalkerDecoderLayer {
-    // Input LayerNorm
-    input_ln_weight: Tensor,
-    // Self-attention
-    q_proj_weight: Tensor,
-    k_proj_weight: Tensor,
-    v_proj_weight: Tensor,
-    o_proj_weight: Tensor,
-    q_norm_weight: Tensor,
-    k_norm_weight: Tensor,
-    // Post-attention LayerNorm
-    post_ln_weight: Tensor,
-    // MLP
-    gate_proj_weight: Tensor,
-    up_proj_weight: Tensor,
-    down_proj_weight: Tensor,
-    // Config values
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f64,
-}
-
-impl TalkerDecoderLayer {
-    /// Load layer from weights
-    pub fn from_weights(
-        weights: &HashMap<String, Tensor>,
-        layer_idx: usize,
-        config: &TalkerConfig,
-    ) -> Result<Self> {
-        let prefix = format!("talker.model.layers.{}", layer_idx);
-
-        let input_ln_weight = weights
-            .get(&format!("{}.input_layernorm.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.input_layernorm.weight", prefix))?
-            .clone();
-        let q_proj_weight = weights
-            .get(&format!("{}.self_attn.q_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.q_proj.weight", prefix))?
-            .clone();
-        let k_proj_weight = weights
-            .get(&format!("{}.self_attn.k_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.k_proj.weight", prefix))?
-            .clone();
-        let v_proj_weight = weights
-            .get(&format!("{}.self_attn.v_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.v_proj.weight", prefix))?
-            .clone();
-        let o_proj_weight = weights
-            .get(&format!("{}.self_attn.o_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.o_proj.weight", prefix))?
-            .clone();
-        let q_norm_weight = weights
-            .get(&format!("{}.self_attn.q_norm.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.q_norm.weight", prefix))?
-            .clone();
-        let k_norm_weight = weights
-            .get(&format!("{}.self_attn.k_norm.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.self_attn.k_norm.weight", prefix))?
-            .clone();
-        let post_ln_weight = weights
-            .get(&format!("{}.post_attention_layernorm.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.post_attention_layernorm.weight", prefix))?
-            .clone();
-        let gate_proj_weight = weights
-            .get(&format!("{}.mlp.gate_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.mlp.gate_proj.weight", prefix))?
-            .clone();
-        let up_proj_weight = weights
-            .get(&format!("{}.mlp.up_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.mlp.up_proj.weight", prefix))?
-            .clone();
-        let down_proj_weight = weights
-            .get(&format!("{}.mlp.down_proj.weight", prefix))
-            .ok_or_else(|| anyhow::anyhow!("Missing {}.mlp.down_proj.weight", prefix))?
-            .clone();
-
-        Ok(Self {
-            input_ln_weight,
-            q_proj_weight,
-            k_proj_weight,
-            v_proj_weight,
-            o_proj_weight,
-            q_norm_weight,
-            k_norm_weight,
-            post_ln_weight,
-            gate_proj_weight,
-            up_proj_weight,
-            down_proj_weight,
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            rms_norm_eps: config.rms_norm_eps,
-        })
-    }
-
-    /// Forward pass with optional KV cache
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        rope: &RoPEType,
-        attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut KVCache>,
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (batch, seq_len, _) = hidden_states.dims3()?;
-
-        // Input layer norm
-        let normed = self.rms_norm(hidden_states, &self.input_ln_weight)?;
-
-        // QKV projections
-        let q = self.linear(&normed, &self.q_proj_weight, None)?;
-        let k = self.linear(&normed, &self.k_proj_weight, None)?;
-        let v = self.linear(&normed, &self.v_proj_weight, None)?;
-
-        // Reshape for multi-head attention
-        let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
-        let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
-
-        // QK normalization
-        let q = self.rms_norm(&q, &self.q_norm_weight)?;
-        let k = self.rms_norm(&k, &self.k_norm_weight)?;
-
-        // Transpose to [batch, heads, seq, head_dim]
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-
-        // Apply RoPE
-        let (q, k) = rope.apply(&q, &k, offset)?;
-
-        // Update KV cache
-        let (k, v) = if let Some(cache) = kv_cache {
-            let k = cache.update_k(&k)?;
-            let v = cache.update_v(&v)?;
-            (k, v)
-        } else {
-            (k, v)
-        };
-
-        // Repeat KV for GQA
-        let k = self.repeat_kv(&k)?;
-        let v = self.repeat_kv(&v)?;
-
-        // Scaled dot-product attention
-        let scale = (self.head_dim as f64).powf(-0.5);
-        let attn_weights = q
-            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
-            .affine(scale, 0.0)?;
-
-        let attn_weights = if let Some(mask) = attention_mask {
-            attn_weights.broadcast_add(mask)?
-        } else {
-            attn_weights
-        };
-
-        let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_probs.matmul(&v)?;
-
-        // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
-        let attn_output = attn_output.transpose(1, 2)?.reshape((
-            batch,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
-
-        // O projection
-        let attn_output = self.linear(&attn_output, &self.o_proj_weight, None)?;
-
-        // Residual
-        let hidden_states = (hidden_states + attn_output)?;
-
-        // MLP
-        let normed = self.rms_norm(&hidden_states, &self.post_ln_weight)?;
-        let gate = self.linear(&normed, &self.gate_proj_weight, None)?;
-        let up = self.linear(&normed, &self.up_proj_weight, None)?;
-        let mlp_output = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        let mlp_output = self.linear(&mlp_output, &self.down_proj_weight, None)?;
-
-        // Final residual
-        Ok((hidden_states + mlp_output)?)
-    }
-
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_norm = x.broadcast_div(&(variance + self.rms_norm_eps)?.sqrt()?)?;
-        Ok(x_norm.broadcast_mul(weight)?)
-    }
-
-    fn linear(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        let dims = x.dims();
-        if dims.len() == 3 {
-            let (batch, seq, _features) = (dims[0], dims[1], dims[2]);
-            let x_2d = x.reshape((batch * seq, x.dim(2)?))?;
-            let out_2d = x_2d.matmul(&weight.t()?)?;
-            let out_3d = out_2d.reshape((batch, seq, out_2d.dim(1)?))?;
-            match bias {
-                Some(b) => Ok(out_3d.broadcast_add(b)?),
-                None => Ok(out_3d),
-            }
-        } else {
-            let out = x.matmul(&weight.t()?)?;
-            match bias {
-                Some(b) => Ok(out.broadcast_add(b)?),
-                None => Ok(out),
-            }
-        }
-    }
-
-    fn repeat_kv(&self, x: &Tensor) -> Result<Tensor> {
-        let n_rep = self.num_heads / self.num_kv_heads;
-        if n_rep == 1 {
-            return Ok(x.clone());
-        }
-        let (batch, num_kv_heads, seq_len, head_dim) = x.dims4()?;
-        let x = x
-            .unsqueeze(2)?
-            .expand((batch, num_kv_heads, n_rep, seq_len, head_dim))?
-            .reshape((batch, num_kv_heads * n_rep, seq_len, head_dim))?;
-        Ok(x)
-    }
-}
-
 impl TalkerModel {
-    /// Load model from weight tensors
+    /// Load model from weight tensors with auto-detected config
+    ///
+    /// Inspects `talker.model.norm.weight` shape to determine model variant:
+    /// - hidden_size=1024 → Base model (`TalkerConfig::default()`)
+    /// - hidden_size=2048 → CustomVoice model (`TalkerConfig::custom_voice()`)
     pub fn from_weights(weights: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
-        let config = TalkerConfig::default();
+        let norm_weight = weights
+            .get("talker.model.norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
+        let hidden_size = norm_weight.dim(0)?;
+        let config = if hidden_size == 2048 {
+            TalkerConfig::custom_voice()
+        } else {
+            TalkerConfig::default()
+        };
         Self::from_weights_with_config(weights, config, device)
     }
 
-    /// Load model with custom config
+    /// Load model with explicit config
     pub fn from_weights_with_config(
         weights: &HashMap<String, Tensor>,
         config: TalkerConfig,
         device: &Device,
     ) -> Result<Self> {
-        // Text embedding
-        let text_embedding = weights
-            .get("talker.model.text_embedding.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.text_embedding.weight"))?
-            .clone();
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, device);
+        let talker = vb.pp("talker");
+        let model = talker.pp("model");
+        let layer_config = config.to_layer_config();
 
-        // Text projection
-        let text_projection = TextProjection::from_weights(weights)?;
+        let text_embedding = embedding(
+            config.text_vocab_size,
+            config.text_embed_dim,
+            model.pp("text_embedding"),
+        )?;
+        let text_projection = TextProjection::new(&config, talker.pp("text_projection"))?;
+        let codec_embedding = embedding(
+            config.codec_vocab_size,
+            config.hidden_size,
+            model.pp("codec_embedding"),
+        )?;
+        let norm = rms_norm(config.hidden_size, config.rms_norm_eps, model.pp("norm"))?;
+        let codec_head = linear_no_bias(
+            config.hidden_size,
+            config.codec_vocab_size,
+            talker.pp("codec_head"),
+        )?;
 
-        // Codec embedding
-        let codec_embedding = weights
-            .get("talker.model.codec_embedding.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.codec_embedding.weight"))?
-            .clone();
-
-        // Decoder layers
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(TalkerDecoderLayer::from_weights(weights, i, &config)?);
-        }
-
-        // Final norm
-        let norm_weight = weights
-            .get("talker.model.norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?
-            .clone();
-
-        // Codec head
-        let codec_head = weights
-            .get("talker.codec_head.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.codec_head.weight"))?
-            .clone();
+        let layers = (0..config.num_hidden_layers)
+            .map(|i| DecoderLayer::new(&layer_config, model.pp(format!("layers.{}", i))))
+            .collect::<Result<Vec<_>>>()?;
 
         // RoPE - use MRoPE if mrope_section is configured
         let rope = if let Some(mrope_section) = config.mrope_section {
@@ -603,7 +346,7 @@ impl TalkerModel {
             text_projection,
             codec_embedding,
             layers,
-            norm_weight,
+            norm,
             codec_head,
             rope,
             config,
@@ -624,7 +367,7 @@ impl TalkerModel {
 
         // Embed text tokens
         let input_ids_flat = input_ids.flatten_all()?;
-        let text_embed = self.text_embedding.index_select(&input_ids_flat, 0)?;
+        let text_embed = self.text_embedding.forward(&input_ids_flat)?;
         let text_embed = text_embed.reshape((1, seq_len, self.config.text_embed_dim))?;
 
         // Debug: print embedding values
@@ -653,11 +396,11 @@ impl TalkerModel {
         }
 
         // Final norm
-        hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+        hidden = self.norm.forward(&hidden)?;
 
         // Get logits for last position
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.linear(&last_hidden, &self.codec_head, None)?;
+        let logits = self.codec_head.forward(&last_hidden)?;
 
         // Debug: print logits for first few tokens
         #[cfg(debug_assertions)]
@@ -718,7 +461,7 @@ impl TalkerModel {
 
         // === 1. Role prefix: text_proj([im_start, assistant, newline]) ===
         let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
-        let role_prefix_embed = self.text_embedding.index_select(&role_prefix_ids, 0)?;
+        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
         let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
         let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?; // [1, 3, hidden]
 
@@ -733,18 +476,18 @@ impl TalkerModel {
             CODEC_BOS,
         ];
         let codec_ids = Tensor::new(codec_tokens_list.as_slice(), &self.device)?;
-        let codec_embed = self.codec_embedding.index_select(&codec_ids, 0)?;
+        let codec_embed = self.codec_embedding.forward(&codec_ids)?;
         let codec_embed = codec_embed.unsqueeze(0)?; // [1, 7, hidden]
 
         // === 3. TTS pad/bos text embeddings ===
         // We need 5 tts_pad + 1 tts_bos = 6 total to add with first 6 codec tokens
         let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.index_select(&tts_pad_id, 0)?;
+        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?;
         let tts_pad_embed = tts_pad_embed.unsqueeze(0)?; // [1, 1, embed_dim]
         let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?; // [1, 1, hidden]
 
         let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.index_select(&tts_bos_id, 0)?;
+        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?;
         let tts_bos_embed = tts_bos_embed.unsqueeze(0)?;
         let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?; // [1, 1, hidden]
 
@@ -762,7 +505,7 @@ impl TalkerModel {
         // === 5. Add first text token (text_proj + codec_bos) ===
         if !text_tokens.is_empty() {
             let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
-            let first_text_embed = self.text_embedding.index_select(&first_text_id, 0)?;
+            let first_text_embed = self.text_embedding.forward(&first_text_id)?;
             let first_text_embed = first_text_embed.unsqueeze(0)?;
             let first_text_proj = self.text_projection.forward(&first_text_embed)?; // [1, 1, hidden]
 
@@ -784,125 +527,13 @@ impl TalkerModel {
         }
 
         // Final norm
-        hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+        hidden = self.norm.forward(&hidden)?;
 
         // Get logits for last position
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.linear(&last_hidden, &self.codec_head, None)?;
+        let logits = self.codec_head.forward(&last_hidden)?;
 
         Ok((hidden, logits))
-    }
-
-    /// Generate semantic tokens with CustomVoice
-    ///
-    /// Full generation loop using CustomVoice prefill.
-    pub fn generate_custom_voice(
-        &self,
-        text_tokens: &[u32],
-        speaker: Speaker,
-        language: Language,
-        config: &GenerationConfig,
-    ) -> Result<Vec<u32>> {
-        let mut kv_caches = self.new_kv_caches();
-
-        // Prefill with CustomVoice format
-        let (_hidden, logits) =
-            self.prefill_custom_voice(text_tokens, speaker, language, &mut kv_caches)?;
-
-        // Calculate offset (text_chatml + codec_prefix + speaker + codec_bos)
-        // ChatML: 3 + text_len + 5 = 8 + text_len
-        // Codec: 4 + 1 + 2 = 7
-        let chatml_len = 3 + text_tokens.len() + 5;
-        let codec_len = 4 + 1 + 2;
-        let mut offset = chatml_len + codec_len;
-
-        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
-        // vocab_size=3072, codebook_size=2048
-        // EOS token (151670) is outside this range anyway, so use a default
-        let eos_for_suppression = config.eos_token_id.unwrap_or(151670);
-        let logits_suppressed = crate::generation::apply_token_suppression(
-            &logits.squeeze(1)?,
-            3072,
-            eos_for_suppression,
-        )?;
-
-        // Sample first token
-        let first_token = crate::generation::sample(&logits_suppressed, config)?;
-        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-        let mut generated = vec![first_token_id];
-
-        // Check for EOS
-        if let Some(eos_id) = config.eos_token_id {
-            if first_token_id == eos_id {
-                return Ok(generated);
-            }
-        }
-
-        // Generate remaining tokens
-        for _ in 1..config.max_new_tokens {
-            let prev_token = *generated.last().unwrap();
-            let (_hidden, logits) = self.generate_step(prev_token, &mut kv_caches, offset)?;
-            offset += 1;
-
-            // Apply token suppression before sampling
-            let logits_suppressed = crate::generation::apply_token_suppression(
-                &logits.squeeze(1)?,
-                3072,
-                eos_for_suppression,
-            )?;
-
-            // Sample next token
-            let next_token = crate::generation::sample(&logits_suppressed, config)?;
-            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-            generated.push(next_token_id);
-
-            // Check for EOS
-            if let Some(eos_id) = config.eos_token_id {
-                if next_token_id == eos_id {
-                    break;
-                }
-            }
-        }
-
-        Ok(generated)
-    }
-
-    /// Generate next token given previous codec token
-    ///
-    /// Uses KV cache for efficient autoregressive generation.
-    pub fn generate_step(
-        &self,
-        prev_token: u32,
-        kv_caches: &mut [KVCache],
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        self.generate_step_with_text(prev_token, kv_caches, offset, None)
-    }
-
-    /// Generate step with optional text embedding to add
-    ///
-    /// For CustomVoice, the text embedding (tts_pad_embed) should be added to the
-    /// codec embedding at each generation step.
-    pub fn generate_step_with_text(
-        &self,
-        prev_token: u32,
-        kv_caches: &mut [KVCache],
-        offset: usize,
-        text_embed: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        // Embed previous codec token
-        let token_tensor = Tensor::new(&[prev_token], &self.device)?;
-        let token_embed = self.codec_embedding.index_select(&token_tensor, 0)?;
-        let mut hidden = token_embed.unsqueeze(0)?; // [1, 1, hidden_size]
-
-        // Add text embedding if provided (for CustomVoice)
-        if let Some(text) = text_embed {
-            hidden = hidden.add(text)?;
-        }
-
-        self.generate_step_with_embed(&hidden, kv_caches, offset)
     }
 
     /// Generate step with pre-built input embedding
@@ -931,10 +562,10 @@ impl TalkerModel {
         }
 
         // Final norm
-        hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+        hidden = self.norm.forward(&hidden)?;
 
         // Get logits
-        let logits = self.linear(&hidden, &self.codec_head, None)?;
+        let logits = self.codec_head.forward(&hidden)?;
 
         Ok((hidden, logits))
     }
@@ -945,7 +576,7 @@ impl TalkerModel {
     pub fn get_tts_pad_embed(&self) -> Result<Tensor> {
         use tts_tokens::TTS_PAD;
         let pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let pad_embed = self.text_embedding.index_select(&pad_id, 0)?;
+        let pad_embed = self.text_embedding.forward(&pad_id)?;
         let pad_embed = pad_embed.unsqueeze(0)?;
         self.text_projection.forward(&pad_embed)
     }
@@ -956,7 +587,7 @@ impl TalkerModel {
     pub fn get_tts_eos_embed(&self) -> Result<Tensor> {
         use tts_tokens::TTS_EOS;
         let eos_id = Tensor::new(&[TTS_EOS], &self.device)?;
-        let eos_embed = self.text_embedding.index_select(&eos_id, 0)?;
+        let eos_embed = self.text_embedding.forward(&eos_id)?;
         let eos_embed = eos_embed.unsqueeze(0)?;
         self.text_projection.forward(&eos_embed)
     }
@@ -976,7 +607,7 @@ impl TalkerModel {
 
         let ids: Vec<u32> = token_ids.to_vec();
         let ids_tensor = Tensor::new(ids.as_slice(), &self.device)?;
-        let embeds = self.text_embedding.index_select(&ids_tensor, 0)?;
+        let embeds = self.text_embedding.forward(&ids_tensor)?;
         let embeds = embeds.unsqueeze(0)?; // [1, seq_len, text_embed_dim]
         self.text_projection.forward(&embeds)
     }
@@ -987,7 +618,7 @@ impl TalkerModel {
 
         // Embed text tokens
         let input_ids_flat = input_ids.flatten_all()?;
-        let text_embed = self.text_embedding.index_select(&input_ids_flat, 0)?;
+        let text_embed = self.text_embedding.forward(&input_ids_flat)?;
         let text_embed = text_embed.reshape((1, seq_len, self.config.text_embed_dim))?;
 
         // Project to hidden dimension
@@ -1002,81 +633,12 @@ impl TalkerModel {
         }
 
         // Final norm
-        hidden = self.rms_norm(&hidden, &self.norm_weight)?;
+        hidden = self.norm.forward(&hidden)?;
 
         // Get logits for all positions
-        let logits = self.linear(&hidden, &self.codec_head, None)?;
+        let logits = self.codec_head.forward(&hidden)?;
 
         Ok(logits)
-    }
-
-    /// Autoregressive generation
-    pub fn generate(&self, input_ids: &Tensor, config: &GenerationConfig) -> Result<Vec<u32>> {
-        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
-            .map(|_| KVCache::new())
-            .collect();
-
-        // Prefill with text
-        let (_hidden, logits) = self.prefill(input_ids, &mut kv_caches)?;
-        let mut offset = input_ids.dim(1)?;
-
-        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
-        // vocab_size=3072, codebook_size=2048
-        let eos_for_suppression = config.eos_token_id.unwrap_or(151670);
-        let logits_suppressed = crate::generation::apply_token_suppression(
-            &logits.squeeze(1)?,
-            3072,
-            eos_for_suppression,
-        )?;
-
-        // Sample first token
-        let first_token = crate::generation::sample(&logits_suppressed, config)?;
-        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-        let mut generated = vec![first_token_id];
-
-        // Check for EOS
-        if let Some(eos_id) = config.eos_token_id {
-            if first_token_id == eos_id {
-                return Ok(generated);
-            }
-        }
-
-        // Generate remaining tokens
-        for _ in 1..config.max_new_tokens {
-            let prev_token = *generated.last().unwrap();
-            let (_hidden, logits) = self.generate_step(prev_token, &mut kv_caches, offset)?;
-            offset += 1;
-
-            // Apply token suppression before sampling
-            let logits_suppressed = crate::generation::apply_token_suppression(
-                &logits.squeeze(1)?,
-                3072,
-                eos_for_suppression,
-            )?;
-
-            // Sample next token
-            let next_token = crate::generation::sample(&logits_suppressed, config)?;
-            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-            generated.push(next_token_id);
-
-            // Check for EOS
-            if let Some(eos_id) = config.eos_token_id {
-                if next_token_id == eos_id {
-                    break;
-                }
-            }
-        }
-
-        Ok(generated)
-    }
-
-    /// Get the hidden state at last position (for code predictor input)
-    pub fn get_last_hidden(&self, input_ids: &Tensor, kv_caches: &mut [KVCache]) -> Result<Tensor> {
-        let (hidden, _logits) = self.prefill(input_ids, kv_caches)?;
-        let seq_len = hidden.dim(1)?;
-        Ok(hidden.i((.., seq_len - 1..seq_len, ..))?)
     }
 
     fn create_causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
@@ -1096,32 +658,6 @@ impl TalkerModel {
         Ok(Tensor::new(mask.as_slice(), &self.device)?.reshape((1, 1, seq_len, total_len))?)
     }
 
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_norm = x.broadcast_div(&(variance + self.config.rms_norm_eps)?.sqrt()?)?;
-        Ok(x_norm.broadcast_mul(weight)?)
-    }
-
-    fn linear(&self, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        let dims = x.dims();
-        if dims.len() == 3 {
-            let (batch, seq, _features) = (dims[0], dims[1], dims[2]);
-            let x_2d = x.reshape((batch * seq, x.dim(2)?))?;
-            let out_2d = x_2d.matmul(&weight.t()?)?;
-            let out_3d = out_2d.reshape((batch, seq, out_2d.dim(1)?))?;
-            match bias {
-                Some(b) => Ok(out_3d.broadcast_add(b)?),
-                None => Ok(out_3d),
-            }
-        } else {
-            let out = x.matmul(&weight.t()?)?;
-            match bias {
-                Some(b) => Ok(out.broadcast_add(b)?),
-                None => Ok(out),
-            }
-        }
-    }
-
     /// Create new KV caches for generation
     pub fn new_kv_caches(&self) -> Vec<KVCache> {
         (0..self.config.num_hidden_layers)
@@ -1132,7 +668,7 @@ impl TalkerModel {
     /// Get codec embedding for a token (used by code predictor)
     pub fn get_codec_embedding(&self, token_id: u32) -> Result<Tensor> {
         let token_tensor = Tensor::new(&[token_id], &self.device)?;
-        let embed = self.codec_embedding.index_select(&token_tensor, 0)?;
+        let embed = self.codec_embedding.forward(&token_tensor)?;
         Ok(embed.unsqueeze(0)?) // [1, 1, hidden_size]
     }
 

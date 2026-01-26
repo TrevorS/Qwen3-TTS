@@ -230,6 +230,25 @@ impl MRoPE {
     }
 }
 
+/// Either standard RoPE or MRoPE (multimodal)
+pub enum RoPEType {
+    Standard(RotaryEmbedding),
+    Multimodal(MRoPE),
+}
+
+impl RoPEType {
+    /// Apply rotary embedding to Q and K tensors
+    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+        match self {
+            RoPEType::Standard(rope) => rope.apply(q, k, offset),
+            RoPEType::Multimodal(mrope) => {
+                let seq_len = q.dim(2)?;
+                mrope.apply(q, k, offset, seq_len)
+            }
+        }
+    }
+}
+
 /// Multi-head attention with grouped-query attention and QK normalization
 pub struct Attention {
     q_proj: Linear,
@@ -277,7 +296,7 @@ impl Attention {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        rope: &RotaryEmbedding,
+        rope: &RoPEType,
         attention_mask: Option<&Tensor>,
         kv_cache: Option<&mut KVCache>,
         offset: usize,
@@ -412,7 +431,7 @@ impl DecoderLayer {
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        rope: &RotaryEmbedding,
+        rope: &RoPEType,
         attention_mask: Option<&Tensor>,
         kv_cache: Option<&mut KVCache>,
         offset: usize,
@@ -658,7 +677,7 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let attn = Attention::new(&config, vb).unwrap();
-        let rope = RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap();
+        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
 
         // Input: [batch=1, seq=10, hidden=64]
         let input = Tensor::randn(0.0f32, 1.0, (1, 10, 64), &device).unwrap();
@@ -674,7 +693,7 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let attn = Attention::new(&config, vb).unwrap();
-        let rope = RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap();
+        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
         let mut cache = KVCache::new();
 
         // First forward
@@ -699,7 +718,7 @@ mod tests {
         let vb = create_mock_vb(&device);
 
         let layer = DecoderLayer::new(&config, vb).unwrap();
-        let rope = RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap();
+        let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
         let mut cache = KVCache::new();
 
         let input = Tensor::randn(0.0f32, 1.0, (1, 8, 64), &device).unwrap();
