@@ -20,8 +20,8 @@ use std::path::Path;
 
 use models::talker::{Language, Speaker, TalkerConfig};
 use qwen3_tts::{
-    generation, models, tokenizer, AudioBuffer, ModelType, ParsedModelConfig, Qwen3TTS,
-    SynthesisOptions,
+    device_info, generation, models, parse_device, tokenizer, AudioBuffer, ModelType,
+    ParsedModelConfig, Qwen3TTS, SynthesisOptions,
 };
 
 /// Generate reference audio with deterministic seed for comparison
@@ -107,6 +107,10 @@ struct Args {
     /// Output WAV file path (overrides default naming in --output-dir)
     #[arg(long)]
     output: Option<String>,
+
+    /// Device for inference (auto, cpu, cuda, cuda:N, metal)
+    #[arg(long, default_value = "auto")]
+    device: String,
 }
 
 fn parse_speaker(name: &str) -> Result<Speaker> {
@@ -216,7 +220,8 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     generation::reset_rng();
     println!("Seed: {}", args.seed);
 
-    let device = Device::Cpu;
+    let device = parse_device(&args.device)?;
+    println!("Device: {}", device_info(&device));
     let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
 
     // Load reference audio
@@ -343,7 +348,8 @@ fn main() -> Result<()> {
     // Reset RNG to ensure deterministic starting point
     generation::reset_rng();
 
-    let device = Device::Cpu;
+    let device = parse_device(&args.device)?;
+    println!("Device: {}", device_info(&device));
 
     // Create output directory
     let output_dir = Path::new(&args.output_dir);

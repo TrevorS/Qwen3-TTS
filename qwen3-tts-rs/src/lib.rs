@@ -1558,6 +1558,66 @@ pub fn auto_device() -> Result<Device> {
     Ok(Device::Cpu)
 }
 
+/// Parse a device string into a [`Device`].
+///
+/// Supported formats:
+/// - `"auto"` — select best available via [`auto_device`]
+/// - `"cpu"` — force CPU
+/// - `"cuda"` or `"cuda:0"` — CUDA device 0
+/// - `"cuda:N"` — CUDA device N
+/// - `"metal"` — Apple Silicon GPU
+///
+/// # Errors
+///
+/// Returns an error if the device string is unrecognized, the requested
+/// backend wasn't compiled in, or hardware initialization fails.
+pub fn parse_device(device_str: &str) -> Result<Device> {
+    match device_str.to_lowercase().as_str() {
+        "auto" => auto_device(),
+        "cpu" => Ok(Device::Cpu),
+        s if s.starts_with("cuda") => {
+            #[cfg(feature = "cuda")]
+            {
+                let ordinal: usize = if s == "cuda" {
+                    0
+                } else if let Some(idx) = s.strip_prefix("cuda:") {
+                    idx.parse()
+                        .map_err(|e| anyhow::anyhow!("invalid CUDA device index: {e}"))?
+                } else {
+                    0
+                };
+                Device::cuda_if_available(ordinal)
+                    .map_err(|e| anyhow::anyhow!("failed to init CUDA device {ordinal}: {e}"))
+            }
+            #[cfg(not(feature = "cuda"))]
+            anyhow::bail!("CUDA support not compiled in. Rebuild with: cargo build --features cuda")
+        }
+        "metal" => {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0)
+                    .map_err(|e| anyhow::anyhow!("failed to init Metal device: {e}"))
+            }
+            #[cfg(not(feature = "metal"))]
+            anyhow::bail!(
+                "Metal support not compiled in. Rebuild with: cargo build --features metal"
+            )
+        }
+        other => {
+            anyhow::bail!("unknown device '{other}'. Supported: auto, cpu, cuda, cuda:N, metal")
+        }
+    }
+}
+
+/// Human-readable label for a [`Device`].
+pub fn device_info(device: &Device) -> String {
+    match device {
+        Device::Cpu => "CPU".to_string(),
+        Device::Cuda(_) => "CUDA".to_string(),
+        Device::Metal(_) => "Metal".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
