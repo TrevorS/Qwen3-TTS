@@ -5,7 +5,7 @@ Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high
 ## Features
 
 - **CPU inference** with optional MKL/Accelerate for faster BLAS operations
-- **CUDA** support for NVIDIA GPU acceleration
+- **CUDA** support for NVIDIA GPU acceleration with **bf16** and **Flash Attention 2**
 - **Metal** support for Apple Silicon
 - **Streaming synthesis** for low-latency audio output
 - **Voice cloning** from reference audio (Base models)
@@ -57,6 +57,7 @@ qwen3-tts = { version = "0.1", features = ["hub"] }
 |---------|-------------|
 | `cpu` (default) | CPU inference |
 | `cuda` | NVIDIA GPU acceleration |
+| `flash-attn` | Flash Attention 2 (requires CUDA toolkit; enables bf16 compute) |
 | `metal` | Apple Silicon GPU acceleration |
 | `mkl` | Intel MKL for faster CPU inference |
 | `accelerate` | Apple Accelerate framework |
@@ -252,6 +253,54 @@ cargo run --release --features cli --bin generate_audio -- \
 | `--top-p` | `0.9` | Nucleus sampling threshold |
 | `--repetition-penalty` | `1.05` | Repetition penalty |
 | `--seed` | `42` | Random seed for reproducibility |
+
+## GPU Acceleration
+
+On CUDA devices, the talker and code predictor automatically run in **bf16** for lower memory usage and faster inference. The codec decoder and speaker encoder remain in f32 (convolutional, no attention).
+
+For best performance, build with Flash Attention 2 (requires CUDA toolkit in `PATH`):
+
+```bash
+cargo build --release --features flash-attn,cli
+```
+
+### Building in an NGC container
+
+If your host lacks a CUDA toolkit, use an [NGC PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch):
+
+```bash
+docker run -d --name qwen3-build --gpus all \
+  -v $(pwd):/workspace/project \
+  nvcr.io/nvidia/pytorch:25.12-py3 sleep infinity
+
+# Install Rust
+docker exec qwen3-build bash -c \
+  'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+
+# Build with flash-attn
+docker exec qwen3-build bash -c \
+  'source ~/.cargo/env && cd /workspace/project && cargo build --release --features flash-attn,cli'
+
+# Run inference
+docker exec qwen3-build bash -c \
+  'source ~/.cargo/env && cd /workspace/project && \
+   ./target/release/generate_audio \
+     --model-dir test_data/models/1.7b-base \
+     --text "Hello world" \
+     --ref-audio examples/data/reference.wav \
+     --ref-text "Transcript of reference audio." \
+     --device cuda --seed 42 --duration 8 \
+     --output /tmp/output.wav'
+```
+
+### Dtype behavior
+
+| Component | CPU | CUDA | CUDA + flash-attn |
+|-----------|-----|------|--------------------|
+| Talker (transformer) | F32 | BF16 | BF16 |
+| Code Predictor | F32 | BF16 | BF16 |
+| Codec Decoder | F32 | F32 | F32 |
+| Speaker Encoder | F32 | F32 | F32 |
 
 ## Model Files
 

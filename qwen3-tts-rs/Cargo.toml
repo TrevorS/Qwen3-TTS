@@ -9,6 +9,7 @@ license = "MIT"
 default = ["cpu"]
 cpu = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
@@ -20,6 +21,7 @@ hub = ["hf-hub"]
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
+candle-flash-attn = { version = "0.9", optional = true }
 
 # Tokenization (HuggingFace tokenizers in Rust)
 tokenizers = "0.21"

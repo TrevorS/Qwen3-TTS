@@ -29,7 +29,7 @@ Component-by-component validation of the Rust implementation against Python refe
 | Full 12Hz Decoder | ✅ Pass | 3e-6 | Quantizer → audio |
 | End-to-End Pipeline | ✅ Pass | 2e-6 | Text → audio |
 
-**Test Totals:** 164 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests = 234 passing
+**Test Totals:** 170 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests = 240 passing
 
 ## Architecture Details
 
@@ -179,3 +179,33 @@ cargo test --test reference_validation -- --nocapture
   Max diff from Python: 0.000002
   END-TO-END PASS!
 ```
+
+## CUDA + bf16 + Flash Attention 2 Validation
+
+Validated on NVIDIA GB10 (Grace Blackwell, aarch64, compute capability 12.1) using `nvcr.io/nvidia/pytorch:25.12-py3` container.
+
+### Build validation
+
+| Step | Command | Result |
+|------|---------|--------|
+| Format | `cargo fmt --check` | Pass |
+| Lint | `cargo clippy --lib` | Pass (0 warnings) |
+| Lint (flash-attn) | `cargo clippy --lib --features flash-attn` | Pass (0 warnings) |
+| Tests | `cargo test --lib` | 170 passed, 1 ignored |
+
+### Runtime validation
+
+Inference tested with `--features flash-attn,cli` release build on CUDA:
+
+| Model | Mode | Whisper Transcription (large-v3) | Assessment |
+|-------|------|----------------------------------|------------|
+| 1.7B Base | ICL voice clone | "That's one tank. Flash attention pipeline." | Intelligible — key phrases preserved |
+| 0.6B Base | ICL voice clone | "Flat, splashes." | Expected — 0.6B produces less intelligible output |
+
+### Dtype boundary fixes required for bf16
+
+1. **RoPE cos/sin**: Computed as F32 from position indices, must cast to input dtype (BF16) before multiply
+2. **Attention masks**: F32 masks must cast to `attn_weights.dtype()` in non-flash-attn path
+3. **Logit sampling**: BF16 logits must cast to F32 before `to_vec1::<f32>()` in penalty functions
+4. **Speaker embedding**: F32 speaker encoder output must cast to `compute_dtype` at the talker boundary
+5. **Empty tensors**: Hardcoded `DType::F32` in `get_projected_text_embeddings()` must match model dtype

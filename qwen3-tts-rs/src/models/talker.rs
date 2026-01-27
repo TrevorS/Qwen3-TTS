@@ -323,7 +323,17 @@ impl TalkerModel {
         config: TalkerConfig,
         device: &Device,
     ) -> Result<Self> {
-        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, device);
+        Self::from_weights_with_config_dtype(weights, config, device, DType::F32)
+    }
+
+    /// Load model with explicit config and dtype (use BF16 on CUDA for half-precision inference)
+    pub fn from_weights_with_config_dtype(
+        weights: &HashMap<String, Tensor>,
+        config: TalkerConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
         let talker = vb.pp("talker");
         let model = talker.pp("model");
         let layer_config = config.to_layer_config();
@@ -773,10 +783,11 @@ impl TalkerModel {
     /// Returns [1, seq_len, hidden_size] tensor of projected text embeddings.
     pub fn get_projected_text_embeddings(&self, token_ids: &[u32]) -> Result<Tensor> {
         if token_ids.is_empty() {
-            // Return empty tensor with correct shape
+            // Return empty tensor with correct shape and matching dtype
+            let dtype = self.text_embedding.embeddings().dtype();
             return Ok(Tensor::zeros(
                 (1, 0, self.config.hidden_size),
-                candle_core::DType::F32,
+                dtype,
                 &self.device,
             )?);
         }

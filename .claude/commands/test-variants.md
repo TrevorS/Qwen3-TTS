@@ -1,22 +1,41 @@
 # Test All Model Variants
 
-Build the CLI and run all 8 valid model+mode combinations to generate test WAV files, then serve them over HTTP.
+Build the CLI and run all valid model+mode+device combinations to generate test WAV files, then serve them over HTTP.
 
 ## Build
 
+Detect the best feature set and build accordingly:
+
 ```bash
+# With CUDA toolkit + flash-attn support (bf16 + Flash Attention 2):
+cargo build --release --features flash-attn,cli --manifest-path qwen3-tts-rs/Cargo.toml
+
+# With CUDA toolkit, no flash-attn:
+cargo build --release --features cuda,cli --manifest-path qwen3-tts-rs/Cargo.toml
+
+# CPU only:
 cargo build --release --features cli --manifest-path qwen3-tts-rs/Cargo.toml
+```
+
+Or use the script's `--build` flag which auto-detects:
+
+```bash
+./qwen3-tts-rs/scripts/test-variants.sh --build
 ```
 
 ## Test Matrix
 
-Run each of the following 8 commands. Use the release binary at `qwen3-tts-rs/target/release/generate_audio`.
+Run each of the following combinations. Use the release binary at `qwen3-tts-rs/target/release/generate_audio`.
 
 Create the output directory first:
 
 ```bash
 mkdir -p test_data/variant_tests
 ```
+
+### Devices
+
+Test on all available devices. On a CUDA machine, test both `cpu` and `cuda` to compare.
 
 ### Base models (voice cloning with reference audio)
 
@@ -109,35 +128,74 @@ ICL transcript: `"That's one small step for man, one giant leap for mankind."`
   --output test_data/variant_tests/1.7b-customvoice-serena.wav
 ```
 
-## Run all 8 tests
+### VoiceDesign models (text-prompted voice — not yet supported)
 
-Execute each command above sequentially. If a model directory doesn't exist, skip that test and note it in the summary.
+VoiceDesign uses natural language descriptions to design voices (`tts_model_type: voice_design`, empty `spk_id` map). The CLI doesn't support this yet. The script auto-detects VoiceDesign from `config.json` and skips it.
+
+### Adding `--device cuda` for GPU tests
+
+When CUDA is available, repeat each test above with `--device cuda` and write to a `cuda/` subdirectory. The script handles this automatically.
+
+## Run with the script
+
+The script auto-discovers models, detects devices, and runs the full matrix:
+
+```bash
+# Auto-detect everything, build first
+./qwen3-tts-rs/scripts/test-variants.sh --build
+
+# CPU only
+./qwen3-tts-rs/scripts/test-variants.sh --device cpu
+
+# CUDA only
+./qwen3-tts-rs/scripts/test-variants.sh --device cuda
+
+# Both devices, then serve results
+./qwen3-tts-rs/scripts/test-variants.sh --device cpu --device cuda --serve
+
+# Inside an NGC container (build with flash-attn)
+./qwen3-tts-rs/scripts/test-variants.sh --build --device cuda --serve --hostname $(hostname)
+```
+
+## Output
+
+The script generates two files in `test_data/variant_tests/`:
+
+- **`index.html`** — Dark-themed dashboard with summary table, speedup ratios, and `<audio>` players for every output. Open in a browser or serve over HTTP.
+- **`results.json`** — Machine-readable array of `{label, device, time, status, size, file}` objects for downstream tools (e.g. Whisper transcription).
 
 ## Serve results
 
-After all tests complete, start an HTTP server:
+Use `--serve` to start an HTTP server after tests complete:
+
+```bash
+./qwen3-tts-rs/scripts/test-variants.sh --build --serve --hostname $(hostname)
+```
+
+Then open `http://<hostname>:8765/` in a browser to listen to all variants with descriptions.
+
+To serve manually:
 
 ```bash
 python3 -m http.server 8765 -d test_data/variant_tests/
 ```
 
-Print the URLs for each generated file using `spark-ebf0` as the hostname:
+## Whisper quality check
 
-```
-http://spark-ebf0:8765/0.6b-base-xvector-apollo11.wav
-http://spark-ebf0:8765/0.6b-base-icl-apollo11.wav
-http://spark-ebf0:8765/1.7b-base-xvector-apollo11.wav
-http://spark-ebf0:8765/1.7b-base-icl-apollo11.wav
-http://spark-ebf0:8765/0.6b-customvoice-ryan.wav
-http://spark-ebf0:8765/0.6b-customvoice-serena.wav
-http://spark-ebf0:8765/1.7b-customvoice-ryan.wav
-http://spark-ebf0:8765/1.7b-customvoice-serena.wav
+After generating variants, transcribe with Whisper to verify intelligibility:
+
+```bash
+uv run --no-project --with openai-whisper --with scipy --python 3.11 \
+  python3 ~/.claude/skills/whisper-test/transcribe.py \
+  --model large-v3 \
+  --expected "Hello world, this is a test." \
+  test_data/variant_tests/cuda/*.wav
 ```
 
 ## Summary
 
-After all runs, print a summary table showing:
+After all runs, the script prints a summary table showing:
 - Test name
 - Status (pass/fail/skipped)
+- Per-device timing (with speedup ratio when multiple devices are tested)
 - Output file size
-- Duration of generated audio (if available from CLI output)

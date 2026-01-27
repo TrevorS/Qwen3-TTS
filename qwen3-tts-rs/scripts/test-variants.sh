@@ -63,14 +63,23 @@ done
 # ── Build ─────────────────────────────────────────────────────────────
 if $BUILD; then
     echo "Building release binary..."
-    # Check for CUDA toolkit
+    # Detect best feature set: flash-attn > cuda > cpu-only
     if command -v nvcc &>/dev/null || [[ -x /usr/local/cuda/bin/nvcc ]]; then
         export PATH="/usr/local/cuda/bin:$PATH"
-        FEATURES="cuda,cli"
+        # Try flash-attn first (bf16 + Flash Attention 2), fall back to cuda-only
+        if cargo build --release --features "flash-attn,cli" --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null; then
+            FEATURES="flash-attn,cli"
+            echo "Built with: flash-attn,cli (bf16 + Flash Attention 2)"
+        else
+            FEATURES="cuda,cli"
+            cargo build --release --features "$FEATURES" --manifest-path "$REPO_ROOT/Cargo.toml"
+            echo "Built with: cuda,cli (flash-attn build failed, using standard CUDA)"
+        fi
     else
         FEATURES="cli"
+        cargo build --release --features "$FEATURES" --manifest-path "$REPO_ROOT/Cargo.toml"
+        echo "Built with: cli (CPU only — no CUDA toolkit found)"
     fi
-    cargo build --release --features "$FEATURES" --manifest-path "$REPO_ROOT/Cargo.toml"
     echo ""
 fi
 
@@ -97,7 +106,7 @@ fi
 # ── Discover models ──────────────────────────────────────────────────
 declare -a MODEL_NAMES=()
 declare -A MODEL_PATHS=()
-declare -A MODEL_TYPES=()  # "base" or "customvoice"
+declare -A MODEL_TYPES=()  # "base", "customvoice", or "voicedesign"
 
 for model_dir in "$MODELS_DIR"/*/; do
     [[ -d "$model_dir" ]] || continue
@@ -106,25 +115,48 @@ for model_dir in "$MODELS_DIR"/*/; do
     # Skip if no model.safetensors
     [[ -f "$model_dir/model.safetensors" ]] || continue
 
-    MODEL_NAMES+=("$name")
     MODEL_PATHS["$name"]="$model_dir"
 
-    # Detect type from config.json
+    # Detect type from config.json tts_model_type field, then fallback heuristics
     if [[ -f "$model_dir/config.json" ]]; then
-        if grep -qi '"model_type".*"base"' "$model_dir/config.json" 2>/dev/null || \
-           grep -qi 'speaker_encoder' "$model_dir/config.json" 2>/dev/null; then
-            MODEL_TYPES["$name"]="base"
-        else
-            MODEL_TYPES["$name"]="customvoice"
-        fi
+        tts_type=$(python3 -c "import json; print(json.load(open('$model_dir/config.json')).get('tts_model_type',''))" 2>/dev/null || echo "")
+        case "$tts_type" in
+            voice_design)
+                MODEL_TYPES["$name"]="voicedesign"
+                ;;
+            custom_voice)
+                MODEL_TYPES["$name"]="customvoice"
+                ;;
+            *)
+                # Fallback: base models have speaker_encoder
+                if grep -q 'speaker_encoder' "$model_dir/config.json" 2>/dev/null; then
+                    MODEL_TYPES["$name"]="base"
+                elif [[ "$name" == *base* ]]; then
+                    MODEL_TYPES["$name"]="base"
+                elif [[ "$name" == *voicedesign* || "$name" == *voice-design* ]]; then
+                    MODEL_TYPES["$name"]="voicedesign"
+                else
+                    MODEL_TYPES["$name"]="customvoice"
+                fi
+                ;;
+        esac
     else
-        # Guess from directory name
         if [[ "$name" == *base* ]]; then
             MODEL_TYPES["$name"]="base"
+        elif [[ "$name" == *voicedesign* || "$name" == *voice-design* ]]; then
+            MODEL_TYPES["$name"]="voicedesign"
         else
             MODEL_TYPES["$name"]="customvoice"
         fi
     fi
+
+    # Skip VoiceDesign — CLI doesn't support text-prompted voice design yet
+    if [[ "${MODEL_TYPES[$name]}" == "voicedesign" ]]; then
+        echo "SKIP: $name (VoiceDesign requires text-prompted voice descriptions, not yet in CLI)"
+        continue
+    fi
+
+    MODEL_NAMES+=("$name")
 done
 
 if [[ ${#MODEL_NAMES[@]} -eq 0 ]]; then
@@ -332,6 +364,143 @@ done
 echo ""
 echo "Results: $pass_count passed, $fail_count failed out of $total_runs total"
 
+# ── Generate results JSON ────────────────────────────────────────────
+results_json="$OUTPUT_BASE/results.json"
+{
+    echo "["
+    for i in "${!RESULT_LABELS[@]}"; do
+        [[ $i -gt 0 ]] && echo ","
+        relpath="${RESULT_FILES[$i]#$OUTPUT_BASE/}"
+        printf '  {"label":"%s","device":"%s","time":"%s","status":"%s","size":"%s","file":"%s"}' \
+            "${RESULT_LABELS[$i]}" "${RESULT_DEVICES[$i]}" \
+            "${RESULT_TIMES[$i]}" "${RESULT_STATUSES[$i]}" \
+            "${RESULT_SIZES[$i]}" "$relpath"
+    done
+    echo ""
+    echo "]"
+} > "$results_json"
+
+# ── Generate index.html with audio players ──────────────────────────
+index_html="$OUTPUT_BASE/index.html"
+cat > "$index_html" <<'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS Variant Test Results</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+  h1 { color: #fff; border-bottom: 2px solid #444; padding-bottom: 10px; }
+  h2 { color: #ccc; margin-top: 30px; }
+  .meta { color: #888; font-size: 14px; margin-bottom: 20px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #333; padding: 8px 12px; text-align: left; }
+  th { background: #2a2a4a; color: #fff; }
+  tr:nth-child(even) { background: #1e1e3a; }
+  tr:nth-child(odd) { background: #222244; }
+  .pass { color: #4caf50; font-weight: bold; }
+  .fail { color: #f44336; font-weight: bold; }
+  .speedup { color: #ff9800; font-weight: bold; }
+  audio { width: 100%; max-width: 400px; }
+  .card { background: #222244; border: 1px solid #333; border-radius: 8px; padding: 16px; margin: 12px 0; }
+  .card h3 { margin: 0 0 8px 0; color: #fff; }
+  .card .details { color: #888; font-size: 13px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>TTS Variant Test Results</h1>
+HTMLHEAD
+
+# Add metadata
+{
+    echo "<p class=\"meta\">Generated: $(date -Iseconds) &mdash; Text: &quot;${TEXT}&quot; &mdash; Seed: ${SEED} &mdash; Duration: ${DURATION}s</p>"
+
+    # Summary table
+    echo "<h2>Summary</h2>"
+    echo "<table><tr><th>Test</th>"
+    for d in "${DEVICES[@]}"; do
+        echo "<th>$d</th>"
+    done
+    if [[ ${#DEVICES[@]} -gt 1 ]]; then
+        echo "<th>Speedup</th>"
+    fi
+    echo "</tr>"
+
+    # Collect unique labels
+    declare -A html_seen=()
+    declare -a html_unique=()
+    for label in "${RESULT_LABELS[@]}"; do
+        if [[ -z "${html_seen[$label]:-}" ]]; then
+            html_seen["$label"]=1
+            html_unique+=("$label")
+        fi
+    done
+
+    for label in "${html_unique[@]}"; do
+        echo "<tr><td>$label</td>"
+        declare -A html_times=()
+        for i in "${!RESULT_LABELS[@]}"; do
+            if [[ "${RESULT_LABELS[$i]}" == "$label" ]]; then
+                d="${RESULT_DEVICES[$i]}"
+                t="${RESULT_TIMES[$i]}"
+                s="${RESULT_STATUSES[$i]}"
+                if [[ "$s" == "PASS" ]]; then
+                    echo "<td class=\"pass\">${t}s</td>"
+                    html_times["$d"]="$t"
+                else
+                    echo "<td class=\"fail\">FAIL</td>"
+                fi
+            fi
+        done
+
+        if [[ ${#DEVICES[@]} -gt 1 && -n "${html_times[cpu]:-}" ]]; then
+            cpu_t="${html_times[cpu]}"
+            best_gpu=""
+            for d in "${DEVICES[@]}"; do
+                [[ "$d" == "cpu" ]] && continue
+                if [[ -n "${html_times[$d]:-}" ]]; then
+                    if [[ -z "$best_gpu" ]] || awk "BEGIN{exit !($best_gpu > ${html_times[$d]})}" 2>/dev/null; then
+                        best_gpu="${html_times[$d]}"
+                    fi
+                fi
+            done
+            if [[ -n "$best_gpu" ]]; then
+                speedup=$(awk "BEGIN{printf \"%.1fx\", $cpu_t/$best_gpu}")
+                echo "<td class=\"speedup\">$speedup</td>"
+            else
+                echo "<td>-</td>"
+            fi
+        elif [[ ${#DEVICES[@]} -gt 1 ]]; then
+            echo "<td>-</td>"
+        fi
+        echo "</tr>"
+    done
+    echo "</table>"
+
+    # Audio players grouped by device
+    for device in "${DEVICES[@]}"; do
+        echo "<h2>$device</h2>"
+        for i in "${!RESULT_LABELS[@]}"; do
+            if [[ "${RESULT_DEVICES[$i]}" == "$device" && "${RESULT_STATUSES[$i]}" == "PASS" ]]; then
+                relpath="${RESULT_FILES[$i]#$OUTPUT_BASE/}"
+                echo "<div class=\"card\">"
+                echo "  <h3>${RESULT_LABELS[$i]}</h3>"
+                echo "  <div class=\"details\">${RESULT_TIMES[$i]}s &mdash; ${RESULT_SIZES[$i]}</div>"
+                echo "  <audio controls preload=\"metadata\" src=\"$relpath\"></audio>"
+                echo "</div>"
+            fi
+        done
+    done
+
+    echo "<p class=\"meta\">$pass_count passed, $fail_count failed out of $total_runs total</p>"
+    echo "</body></html>"
+} >> "$index_html"
+
+echo ""
+echo "Results: $results_json"
+echo "Listen:  $index_html"
+
 # ── HTTP server ──────────────────────────────────────────────────────
 if $SERVE; then
     echo ""
@@ -346,15 +515,7 @@ if $SERVE; then
     server_pid=$!
     echo "Server PID: $server_pid"
     echo ""
-    echo "Listen to results:"
-
-    for i in "${!RESULT_FILES[@]}"; do
-        if [[ "${RESULT_STATUSES[$i]}" == "PASS" ]]; then
-            relpath="${RESULT_FILES[$i]#$OUTPUT_BASE/}"
-            echo "  http://${HOSTNAME}:${HTTP_PORT}/${relpath}"
-        fi
-    done
-
+    echo "  http://${HOSTNAME}:${HTTP_PORT}/"
     echo ""
     echo "Stop server: kill $server_pid"
 fi

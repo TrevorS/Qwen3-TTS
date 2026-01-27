@@ -146,6 +146,8 @@ pub struct Qwen3TTS {
     model_type: Option<ModelType>,
     /// Device to run inference on
     device: Device,
+    /// Compute dtype for talker + code predictor (BF16 on CUDA, F32 otherwise)
+    compute_dtype: DType,
 }
 
 impl Qwen3TTS {
@@ -155,6 +157,14 @@ impl Qwen3TTS {
     /// from `config.json` if present, falling back to weight inspection.
     pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from: {}", model_id);
+
+        // BF16 on CUDA for flash-attn compatibility, F32 elsewhere
+        let compute_dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        tracing::info!("Compute dtype: {:?}", compute_dtype);
 
         // Try to parse config.json for auto-detection
         let config_path = Path::new(model_id).join("config.json");
@@ -193,9 +203,19 @@ impl Qwen3TTS {
         // Create TalkerModel — prefer config.json, fallback to weight inspection
         let talker = if let Some(ref cfg) = parsed_config {
             let talker_config = TalkerConfig::from_parsed(cfg);
-            TalkerModel::from_weights_with_config(&weights, talker_config, &device)?
+            TalkerModel::from_weights_with_config_dtype(
+                &weights,
+                talker_config,
+                &device,
+                compute_dtype,
+            )?
         } else {
-            TalkerModel::from_weights(&weights, &device)?
+            TalkerModel::from_weights_with_config_dtype(
+                &weights,
+                TalkerConfig::default(),
+                &device,
+                compute_dtype,
+            )?
         };
 
         // Create CodePredictor — prefer config.json, fallback to defaults
@@ -205,7 +225,7 @@ impl Qwen3TTS {
             CodePredictorConfig::default()
         };
         let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, &device);
         let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
 
         // Load speech tokenizer for decoder
@@ -228,10 +248,10 @@ impl Qwen3TTS {
             }
         };
 
-        // Create Decoder12Hz
+        // Create Decoder12Hz (always F32 — convolutional, no attention)
         let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
 
-        // Load speaker encoder if weights are present
+        // Load speaker encoder if weights are present (always F32)
         let se_config = parsed_config
             .as_ref()
             .and_then(|c| c.speaker_encoder_config.clone());
@@ -252,6 +272,7 @@ impl Qwen3TTS {
             speech_encoder,
             model_type,
             device,
+            compute_dtype,
         })
     }
 
@@ -265,8 +286,28 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         device: &Device,
     ) -> Result<Self> {
+        let compute_dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+
         // Create TalkerModel (auto-detects from weight shapes)
-        let talker = TalkerModel::from_weights(model_weights, device)?;
+        let norm_weight = model_weights
+            .get("talker.model.norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
+        let hidden_size = norm_weight.dim(0)?;
+        let config = if hidden_size == 2048 {
+            TalkerConfig::custom_voice()
+        } else {
+            TalkerConfig::default()
+        };
+        let talker = TalkerModel::from_weights_with_config_dtype(
+            model_weights,
+            config,
+            device,
+            compute_dtype,
+        )?;
 
         // Create CodePredictor — infer codec_embed_dim from talker hidden_size
         let talker_hidden = talker.config().hidden_size;
@@ -279,13 +320,13 @@ impl Qwen3TTS {
             CodePredictorConfig::default()
         };
         let cp_weights = Self::filter_weights(model_weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, device);
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, device);
         let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
 
-        // Create Decoder12Hz
+        // Create Decoder12Hz (always F32)
         let decoder = Decoder12Hz::from_weights(decoder_weights, Default::default())?;
 
-        // Load speaker encoder if weights are present
+        // Load speaker encoder if weights are present (always F32)
         let speaker_encoder = Self::try_load_speaker_encoder(model_weights, None, device)?;
 
         // Load speech encoder from decoder weights (same safetensors file)
@@ -300,6 +341,7 @@ impl Qwen3TTS {
             speech_encoder,
             model_type: None,
             device: device.clone(),
+            compute_dtype,
         })
     }
 
@@ -320,6 +362,12 @@ impl Qwen3TTS {
     pub fn from_paths(paths: &hub::ModelPaths, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from downloaded paths...");
 
+        let compute_dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+
         // Load text tokenizer
         let text_tokenizer = tokenizer::TextTokenizer::from_file(&paths.tokenizer)?;
 
@@ -327,7 +375,17 @@ impl Qwen3TTS {
         let weights = Self::load_weights(&paths.model_weights, &device)?;
 
         // Create TalkerModel (auto-detects from weight shapes)
-        let talker = TalkerModel::from_weights(&weights, &device)?;
+        let norm_weight = weights
+            .get("talker.model.norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
+        let hidden_size = norm_weight.dim(0)?;
+        let config = if hidden_size == 2048 {
+            TalkerConfig::custom_voice()
+        } else {
+            TalkerConfig::default()
+        };
+        let talker =
+            TalkerModel::from_weights_with_config_dtype(&weights, config, &device, compute_dtype)?;
 
         // Create CodePredictor — infer codec_embed_dim from talker hidden_size
         let talker_hidden = talker.config().hidden_size;
@@ -340,14 +398,14 @@ impl Qwen3TTS {
             CodePredictorConfig::default()
         };
         let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, &device);
         let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
 
-        // Load decoder weights
+        // Load decoder weights (always F32)
         let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
         let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
 
-        // Load speaker encoder if weights are present
+        // Load speaker encoder if weights are present (always F32)
         let speaker_encoder = Self::try_load_speaker_encoder(&weights, None, &device)?;
 
         // Load speech encoder for ICL voice cloning
@@ -362,6 +420,7 @@ impl Qwen3TTS {
             speech_encoder,
             model_type: None,
             device,
+            compute_dtype,
         })
     }
 
@@ -619,11 +678,14 @@ impl Qwen3TTS {
             min_new_tokens: options.min_new_tokens,
         };
 
+        // Cast speaker embedding to compute dtype (speaker encoder produces F32)
+        let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
+
         // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
-            &prompt.speaker_embedding,
+            &speaker_embed,
             language,
             is_icl,
             &mut kv_caches,
@@ -913,11 +975,14 @@ impl Qwen3TTS {
             min_new_tokens: options.min_new_tokens,
         };
 
+        // Cast speaker embedding to compute dtype (speaker encoder produces F32)
+        let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
+
         // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
-            &prompt.speaker_embedding,
+            &speaker_embed,
             language,
             is_icl,
             &mut kv_caches,
@@ -1150,10 +1215,13 @@ impl Qwen3TTS {
         config: &generation::GenerationConfig,
         token_count: usize,
     ) -> Result<Tensor> {
+        // Cast to F32 for penalty math (model may produce BF16 logits)
+        let logits = logits.to_dtype(DType::F32)?;
+
         // 1. Repetition penalty
         let logits = if config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
             let prev = Tensor::new(generated_tokens, &self.device)?;
-            generation::apply_repetition_penalty(logits, &prev, config.repetition_penalty)?
+            generation::apply_repetition_penalty(&logits, &prev, config.repetition_penalty)?
         } else {
             logits.clone()
         };
@@ -1252,21 +1320,12 @@ impl Qwen3TTS {
         }
     }
 
-    /// Load weights from safetensors file
+    /// Load weights from safetensors file.
+    ///
+    /// Tensors are loaded in their native dtype (typically BF16 for Qwen3-TTS).
+    /// Each component's VarBuilder handles casting to its target dtype.
     fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
         let tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
-        // Convert BF16 to F32
-        let tensors: HashMap<String, Tensor> = tensors
-            .into_iter()
-            .map(|(name, tensor)| {
-                let converted = if tensor.dtype() == DType::BF16 {
-                    tensor.to_dtype(DType::F32).unwrap()
-                } else {
-                    tensor
-                };
-                (name, converted)
-            })
-            .collect();
         Ok(tensors)
     }
 

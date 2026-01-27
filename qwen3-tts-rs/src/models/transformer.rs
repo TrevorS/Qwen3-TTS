@@ -7,6 +7,9 @@ use anyhow::Result;
 use candle_core::{Device, IndexOp, Module, Tensor, D};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn::flash_attn;
+
 use super::config::Qwen3TTSConfig;
 
 /// Rotary position embedding (standard RoPE)
@@ -56,10 +59,11 @@ impl RotaryEmbedding {
 
         // Broadcast cos/sin to match x dimensions
         // cos/sin are [seq_len, head_dim/2], need [1, 1, seq_len, head_dim/2]
+        // Cast to x's dtype (cos/sin are computed in f32, x may be bf16)
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-        let cos = cos.broadcast_as(x1.shape())?;
-        let sin = sin.broadcast_as(x1.shape())?;
+        let cos = cos.to_dtype(x.dtype())?.broadcast_as(x1.shape())?;
+        let sin = sin.to_dtype(x.dtype())?.broadcast_as(x1.shape())?;
 
         // Standard RoPE: x * cos + rotate_half(x) * sin
         // where rotate_half([x1, x2]) = [-x2, x1]
@@ -206,8 +210,9 @@ impl MRoPE {
         let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
 
         // cos/sin are [seq_len, head_dim], need [1, 1, seq_len, head_dim]
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+        // Cast to x's dtype (cos/sin are computed in f32, x may be bf16)
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
 
         // For rotation, we need half of cos/sin
         let cos_half = cos.narrow(D::Minus1, 0, d / 2)?;
@@ -334,33 +339,72 @@ impl Attention {
             (k, v)
         };
 
-        // Repeat KV heads for GQA
-        let k = self.repeat_kv(&k)?;
-        let v = self.repeat_kv(&v)?;
+        // ---- Attention computation ----
+        // When compiled with flash-attn, use it on CUDA and fall back to
+        // standard attention on CPU. Without the feature, always use standard.
 
-        // Scaled dot-product attention
-        // Ensure contiguous layout for CUDA matmul (transpose creates non-contiguous views)
-        let q = q.contiguous()?;
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let attn_weights =
-            (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * self.scale)?;
+        #[cfg(feature = "flash-attn")]
+        let use_flash = q.device().is_cuda();
+        #[cfg(not(feature = "flash-attn"))]
+        let use_flash = false;
 
-        let attn_weights = if let Some(mask) = attention_mask {
-            attn_weights.broadcast_add(mask)?
+        let attn_output = if use_flash {
+            #[cfg(feature = "flash-attn")]
+            {
+                // Flash Attention 2: handles GQA natively (no repeat_kv needed),
+                // uses causal=true instead of an explicit attention mask.
+                // Requires half-precision — cast f32→bf16 for the kernel, cast back after.
+                let _ = attention_mask;
+                let input_dtype = q.dtype();
+                // flash_attn expects [B, S, H, D] — transpose back from [B, H, S, D]
+                let q = q
+                    .transpose(1, 2)?
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
+                let k = k
+                    .transpose(1, 2)?
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
+                let v = v
+                    .transpose(1, 2)?
+                    .to_dtype(candle_core::DType::BF16)?
+                    .contiguous()?;
+                let softmax_scale = self.scale as f32;
+                let attn_output = flash_attn(&q, &k, &v, softmax_scale, /* causal */ true)?;
+                // [B, S_q, H_q, D] → cast back → [B, S_q, hidden]
+                attn_output.to_dtype(input_dtype)?.reshape((
+                    batch,
+                    seq_len,
+                    self.num_heads * self.head_dim,
+                ))?
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            unreachable!()
         } else {
-            attn_weights
+            // Manual scaled dot-product attention with GQA repeat
+            let k = self.repeat_kv(&k)?;
+            let v = self.repeat_kv(&v)?;
+            // Ensure contiguous layout for CUDA matmul (transpose creates non-contiguous views)
+            let q = q.contiguous()?;
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            let attn_weights =
+                (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * self.scale)?;
+            let attn_weights = if let Some(mask) = attention_mask {
+                // Cast mask to match attn_weights dtype (e.g. f32 mask with bf16 weights)
+                let mask = mask.to_dtype(attn_weights.dtype())?;
+                attn_weights.broadcast_add(&mask)?
+            } else {
+                attn_weights
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v)?;
+            attn_output.transpose(1, 2)?.reshape((
+                batch,
+                seq_len,
+                self.num_heads * self.head_dim,
+            ))?
         };
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // Reshape back
-        let attn_output = attn_output.transpose(1, 2)?.reshape((
-            batch,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
 
         Ok(self.o_proj.forward(&attn_output)?)
     }
@@ -501,7 +545,9 @@ impl KVCache {
         self.k
             .as_ref()
             .map(|k| {
-                k.flatten_all()
+                k.to_dtype(candle_core::DType::F32)
+                    .unwrap()
+                    .flatten_all()
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap()
@@ -516,7 +562,9 @@ impl KVCache {
         self.v
             .as_ref()
             .map(|v| {
-                v.flatten_all()
+                v.to_dtype(candle_core::DType::F32)
+                    .unwrap()
+                    .flatten_all()
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap()

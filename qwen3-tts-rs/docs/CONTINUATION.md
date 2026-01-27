@@ -23,9 +23,45 @@ Pure Rust implementation of Qwen3-TTS using Candle ML framework. The implementat
 | Full 12Hz Decoder | ✅ | 3e-6 |
 | End-to-end pipeline | ✅ | 2e-6 |
 
-**Test counts:** 165 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests
+**Test counts:** 170 unit tests (1 ignored) + 41 integration tests + 29 reference validation tests
+
+## Audio Quality Status
+
+Tested on NVIDIA GB10 (bf16 + flash-attn) with seed=42, duration=3.0s, text="Hello world, this is a test."
+
+| Variant | Mode | Status | Notes |
+|---------|------|--------|-------|
+| 0.6B Base | x_vector_only | Working | Produces audio |
+| 0.6B Base | ICL | Not working | No intelligible speech |
+| 0.6B CustomVoice | Ryan | Working | Says "hello world" in exaggerated slow voice — good progress |
+| 0.6B CustomVoice | Serena | Working | Produces audio |
+| 1.7B Base | x_vector_only | Working | Produces audio |
+| 1.7B Base | ICL | Not working | No intelligible speech |
+| 1.7B CustomVoice | Ryan | Working | Produces audio |
+| 1.7B CustomVoice | Serena | Working | Produces audio |
+| 1.7B VoiceDesign | * | Not supported | CLI lacks text-prompted voice description; `spk_id` is empty in config |
+
+### Known Issues
+
+- **ICL voice cloning** produces no intelligible speech on either model size. The generation completes without errors but the audio is garbled. This needs investigation — likely an issue in the ICL prefill or trailing text fusion.
+- **VoiceDesign** uses `tts_model_type: voice_design` with an empty `spk_id` map. It requires a natural language voice description, which the CLI and Rust API don't support yet. Passing `--speaker ryan` falls through to undefined behavior (both speakers sound the same/male).
+- **0.6B CustomVoice Ryan** speaks correctly but in an exaggerated, slow cadence. May be a generation config issue (temperature, repetition penalty, frame count).
 
 ## Recent Changes
+
+### Runtime flash-attn fallback
+- Changed flash-attn from compile-time `#[cfg]` gate to runtime `device.is_cuda()` check
+- Same binary now works on both CPU (standard attention) and CUDA (flash attention 2)
+- Removed `#[allow(dead_code)]` from `repeat_kv` since it's always reachable now
+- 20/20 variant tests pass (10 CPU + 10 CUDA, all 5 models)
+
+### Full bf16 + Flash Attention 2 pipeline
+- Added `compute_dtype` field to `Qwen3TTS` — BF16 on CUDA, F32 on CPU
+- Talker and code predictor now run entirely in bf16 on CUDA, matching the official Python recommendation (`dtype=torch.bfloat16, attn_implementation="flash_attention_2"`)
+- Codec decoder and speaker encoder remain in F32 (convolutional, no attention)
+- Added `flash-attn` feature flag for Flash Attention 2 via `candle-flash-attn`
+- Fixed dtype boundary points: RoPE cos/sin casting, attention mask casting, logit F32 casting for sampling, speaker embedding casting at talker boundary, hardcoded F32 empty tensor in `get_projected_text_embeddings()`
+- Validated on NVIDIA GB10 (Grace Blackwell, aarch64) in NGC container: clippy clean, 170 tests pass, 1.7B ICL inference produces intelligible speech
 
 ### Deep cleanup pass: VarBuilder conversion & dead code removal
 - Converted `TalkerModel` from raw `HashMap<String, Tensor>` lookups to `VarBuilder` + typed candle_nn layers (`Embedding`, `Linear`, `RmsNorm`, `DecoderLayer`)
@@ -65,8 +101,9 @@ Pure Rust implementation of Qwen3-TTS using Candle ML framework. The implementat
 - `ModelPaths::download()` - HuggingFace Hub integration
 
 ### Hardware Support
-- CPU (default)
-- CUDA (feature flag)
+- CPU (default, F32)
+- CUDA (feature flag, auto bf16 for transformer components)
+- CUDA + Flash Attention 2 (`flash-attn` feature, requires CUDA toolkit)
 - Metal (feature flag)
 - MKL/Accelerate acceleration
 
