@@ -22,3 +22,7 @@ wheels/
 .vscode/
 venv/
 env/
+
+# Generated test artifacts
+test_data/variant_tests/python-*.wav
+test_data/variant_tests/rust-*-verify.wav
