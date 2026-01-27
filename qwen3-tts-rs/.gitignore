@@ -11,6 +11,9 @@ tools/.venv/
 # Generated audio files
 *.wav
 
+# Reference audio for voice cloning example (public domain, NASA)
+!/examples/data/apollo11_one_small_step.wav
+
 # Python cache
 __pycache__/
 *.pyc

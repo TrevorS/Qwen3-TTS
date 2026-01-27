@@ -248,8 +248,9 @@ mod end_to_end_mock {
             top_k: 30,
             top_p: 0.85,
             repetition_penalty: 1.1,
-            eos_token_id: Some(151670), // audio_end token
+            eos_token_id: Some(qwen3_tts::CODEC_EOS_TOKEN_ID),
             chunk_frames: 10,
+            min_new_tokens: 2,
         };
 
         assert_eq!(options.max_length, 512);
@@ -1164,5 +1165,102 @@ mod model_weights_tests {
         }
 
         println!("\nSuccessfully loaded {} tensors to Candle", tensors.len());
+    }
+}
+
+mod voice_clone_tests {
+    use std::path::Path;
+
+    const MODEL_DIR: &str = "test_data/model";
+    const TEST_WAV: &str = "test_data/test_sine_24khz.wav";
+
+    fn model_available() -> bool {
+        Path::new(MODEL_DIR).join("model.safetensors").exists()
+            && Path::new(MODEL_DIR).join("tokenizer.json").exists()
+            && Path::new(MODEL_DIR)
+                .join("speech_tokenizer/model.safetensors")
+                .exists()
+    }
+
+    fn test_wav_available() -> bool {
+        Path::new(TEST_WAV).exists()
+    }
+
+    #[test]
+    fn test_from_pretrained_base_model() {
+        if !model_available() {
+            eprintln!("Skipping: base model not available at {}", MODEL_DIR);
+            return;
+        }
+
+        use candle_core::Device;
+        use qwen3_tts::Qwen3TTS;
+
+        let model = Qwen3TTS::from_pretrained(MODEL_DIR, Device::Cpu).unwrap();
+        assert!(
+            model.has_speaker_encoder(),
+            "Base model should have speaker encoder"
+        );
+    }
+
+    #[test]
+    fn test_speaker_encoder_extract_embedding() {
+        if !model_available() || !test_wav_available() {
+            eprintln!("Skipping: model or test WAV not available");
+            return;
+        }
+
+        use candle_core::Device;
+        use qwen3_tts::{AudioBuffer, Qwen3TTS};
+
+        let model = Qwen3TTS::from_pretrained(MODEL_DIR, Device::Cpu).unwrap();
+        let audio = AudioBuffer::load(TEST_WAV).unwrap();
+
+        let prompt = model.create_voice_clone_prompt(&audio, None).unwrap();
+        let dims = prompt.speaker_embedding.dims();
+        println!("Speaker embedding shape: {:?}", dims);
+        assert_eq!(dims.len(), 1, "Speaker embedding should be 1-D");
+        assert_eq!(dims[0], 1024, "Speaker embedding should be 1024-dim");
+        assert!(
+            prompt.ref_codes.is_none(),
+            "x_vector_only should have no ref_codes"
+        );
+    }
+
+    #[test]
+    fn test_voice_clone_synthesis_xvector() {
+        if !model_available() || !test_wav_available() {
+            eprintln!("Skipping: model or test WAV not available");
+            return;
+        }
+
+        use candle_core::Device;
+        use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, SynthesisOptions};
+
+        let model = Qwen3TTS::from_pretrained(MODEL_DIR, Device::Cpu).unwrap();
+        let audio = AudioBuffer::load(TEST_WAV).unwrap();
+
+        let prompt = model.create_voice_clone_prompt(&audio, None).unwrap();
+
+        let options = SynthesisOptions {
+            max_length: 10,
+            temperature: 0.7,
+            ..Default::default()
+        };
+
+        let output = model
+            .synthesize_voice_clone("Hello", &prompt, Language::English, Some(options))
+            .unwrap();
+
+        assert!(
+            !output.samples.is_empty(),
+            "Output audio should not be empty"
+        );
+        assert_eq!(output.sample_rate, 24000);
+        println!(
+            "Voice clone output: {} samples ({:.2}s)",
+            output.samples.len(),
+            output.duration()
+        );
     }
 }

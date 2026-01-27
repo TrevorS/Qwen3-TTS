@@ -3107,6 +3107,7 @@ fn test_autoregressive_generation() -> Result<()> {
         top_p: 1.0,
         repetition_penalty: 1.0,
         eos_token_id: None,
+        min_new_tokens: 0,
     };
 
     // Sample first semantic token

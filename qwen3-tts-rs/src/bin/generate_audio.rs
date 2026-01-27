@@ -19,7 +19,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use models::talker::{Language, Speaker, TalkerConfig};
-use qwen3_tts::{generation, models, tokenizer, AudioBuffer};
+use qwen3_tts::{generation, models, tokenizer, AudioBuffer, ModelType, ParsedModelConfig};
 
 /// Generate reference audio with deterministic seed for comparison
 #[derive(Parser, Debug)]
@@ -81,9 +81,25 @@ struct Args {
     #[arg(long, default_value = "english")]
     language: String,
 
-    /// Use CustomVoice model (hidden=2048, MRoPE) instead of standard (hidden=1024)
+    /// Force 1.7B config (hidden=2048). Usually auto-detected from config.json.
     #[arg(long)]
     custom_voice: bool,
+
+    /// Reference audio WAV file for voice cloning (x_vector_only mode)
+    #[arg(long)]
+    ref_audio: Option<String>,
+
+    /// Reference text for ICL voice cloning (requires --ref-audio)
+    #[arg(long)]
+    ref_text: Option<String>,
+
+    /// Use x_vector_only mode (speaker embedding only, no ICL)
+    #[arg(long)]
+    x_vector_only: bool,
+
+    /// Repetition penalty (1.0 = disabled, 1.05 = Python default)
+    #[arg(long, default_value_t = 1.05)]
+    repetition_penalty: f64,
 }
 
 fn parse_speaker(name: &str) -> Result<Speaker> {
@@ -193,23 +209,95 @@ fn main() -> Result<()> {
     // Tokenize text
     let input_ids = text_tokenizer.encode(&args.text)?;
     println!("Input IDs: {:?}", input_ids);
-    // Create models with appropriate config
-    let talker_config = if args.custom_voice {
-        println!("Using CustomVoice config (hidden=2048, MRoPE)");
-        TalkerConfig::custom_voice()
+    // Create models — auto-detect from config.json, fall back to --custom-voice flag
+    let config_path = Path::new(&args.model_dir).join("config.json");
+    let parsed_config = if config_path.exists() {
+        match ParsedModelConfig::from_file(&config_path) {
+            Ok(cfg) => {
+                println!("Detected model variant: {}", cfg.label());
+                Some(cfg)
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to parse config.json: {}", e);
+                None
+            }
+        }
     } else {
-        TalkerConfig::default()
+        None
     };
 
-    println!("Creating TalkerModel...");
+    // Validate CLI args against detected model variant
+    if let Some(ref cfg) = parsed_config {
+        match cfg.model_type {
+            ModelType::Base => {
+                if args.ref_audio.is_none() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: This is a {} model (trained for voice cloning).",
+                        cfg.label()
+                    );
+                    eprintln!("  Without --ref-audio, the output voice will be unpredictable.");
+                    eprintln!("  Recommended usage:");
+                    eprintln!("    --ref-audio <path.wav>                 (x_vector_only mode)");
+                    eprintln!("    --ref-audio <path.wav> --ref-text ...  (ICL mode)");
+                    eprintln!();
+                }
+            }
+            ModelType::CustomVoice => {
+                if args.ref_audio.is_some() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: This is a {} model (preset speakers only).",
+                        cfg.label()
+                    );
+                    eprintln!("  --ref-audio is ignored — CustomVoice models don't have a speaker encoder.");
+                    eprintln!(
+                        "  Use --speaker <name> instead. Available: ryan, serena, vivian, aiden,"
+                    );
+                    eprintln!("  uncle_fu, ono_anna, sohee, eric, dylan");
+                    eprintln!();
+                }
+            }
+            ModelType::VoiceDesign => {
+                eprintln!();
+                eprintln!(
+                    "  NOTE: This is a {} model (text-described voices).",
+                    cfg.label()
+                );
+                eprintln!("  VoiceDesign synthesis is not yet implemented in the CLI.");
+                eprintln!(
+                    "  Falling back to preset speaker prefill — voice will be unpredictable."
+                );
+                eprintln!();
+            }
+        }
+    }
+
+    let (talker_config, cp_config) = if let Some(ref cfg) = parsed_config {
+        (
+            TalkerConfig::from_parsed(cfg),
+            models::CodePredictorConfig::from_parsed(cfg),
+        )
+    } else if args.custom_voice {
+        println!("Using CustomVoice config (hidden=2048, MRoPE)");
+        (
+            TalkerConfig::custom_voice(),
+            models::CodePredictorConfig::custom_voice(),
+        )
+    } else {
+        (
+            TalkerConfig::default(),
+            models::CodePredictorConfig::default(),
+        )
+    };
+
+    println!(
+        "Creating TalkerModel (hidden={})...",
+        talker_config.hidden_size
+    );
     let talker = models::TalkerModel::from_weights_with_config(&weights, talker_config, &device)?;
 
     println!("Creating CodePredictor...");
-    let cp_config = if args.custom_voice {
-        models::CodePredictorConfig::custom_voice()
-    } else {
-        models::CodePredictorConfig::default()
-    };
     let cp_weights = filter_weights(&weights, "talker.code_predictor.");
     let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
     let code_predictor = models::CodePredictor::new(cp_config, cp_vb)?;
@@ -252,8 +340,9 @@ fn main() -> Result<()> {
         temperature: args.temperature,
         top_k: args.top_k,
         top_p: args.top_p,
-        repetition_penalty: 1.0,
+        repetition_penalty: args.repetition_penalty,
         eos_token_id: None, // Don't stop early for comparison
+        min_new_tokens: 2,
     };
 
     // Initialize KV caches
@@ -272,11 +361,22 @@ fn main() -> Result<()> {
     // Get last hidden state (for code predictor input)
     let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-    // Apply token suppression and sample first semantic token
-    // Suppress tokens 2048-3071 (vocab_size=3072, codebook_size=2048)
-    let logits_suppressed = generation::apply_token_suppression(&logits.squeeze(1)?, 3072, 151670)?;
+    // Track generated tokens for repetition penalty
+    let mut generated_tokens: Vec<u32> = Vec::new();
+
+    // Apply repetition penalty + token suppression and sample first semantic token
+    let logits_2d = logits.squeeze(1)?;
+    let logits_2d = if gen_config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+        let prev = Tensor::new(generated_tokens.as_slice(), &device)?;
+        generation::apply_repetition_penalty(&logits_2d, &prev, gen_config.repetition_penalty)?
+    } else {
+        logits_2d
+    };
+    let logits_suppressed =
+        generation::apply_token_suppression(&logits_2d, 3072, qwen3_tts::CODEC_EOS_TOKEN_ID)?;
     let first_token = generation::sample(&logits_suppressed, &gen_config)?;
     let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+    generated_tokens.push(semantic_token);
     println!("First semantic token: {}", semantic_token);
 
     // Collect all codes
@@ -333,11 +433,19 @@ fn main() -> Result<()> {
         offset += 1;
         last_hidden = h;
 
-        // Sample next semantic token
+        // Sample next semantic token with repetition penalty + token suppression
+        let logits_2d = new_logits.squeeze(1)?;
+        let logits_2d = if gen_config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+            let prev = Tensor::new(generated_tokens.as_slice(), &device)?;
+            generation::apply_repetition_penalty(&logits_2d, &prev, gen_config.repetition_penalty)?
+        } else {
+            logits_2d
+        };
         let logits_suppressed =
-            generation::apply_token_suppression(&new_logits.squeeze(1)?, 3072, 151670)?;
+            generation::apply_token_suppression(&logits_2d, 3072, qwen3_tts::CODEC_EOS_TOKEN_ID)?;
         let next_token = generation::sample(&logits_suppressed, &gen_config)?;
         semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+        generated_tokens.push(semantic_token);
     }
 
     progress.finish_with_message("Done generating codes");

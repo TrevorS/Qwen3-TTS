@@ -113,14 +113,6 @@ impl UpsampleStage {
     /// Forward pass
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let hidden = self.trans_conv.forward(x)?;
-        #[cfg(debug_assertions)]
-        {
-            if let Ok(h_vec) = hidden.i((0, ..10, 0)) {
-                if let Ok(v) = h_vec.to_vec1::<f32>() {
-                    eprintln!("DEBUG UPSAMPLE: after trans_conv[:10,0] = {:?}", v);
-                }
-            }
-        }
         self.convnext.forward(&hidden)
     }
 }
@@ -563,24 +555,10 @@ impl Decoder12Hz {
         let first_codes_mod: Vec<i64> =
             first_codes_vec.iter().map(|&c| c % codebook_size).collect();
         let first_codes_tensor =
-            Tensor::from_vec(first_codes_mod.clone(), first_codes_flat.dims(), device)?;
+            Tensor::from_vec(first_codes_mod, first_codes_flat.dims(), device)?;
         let first_embed = self.first_codebook.index_select(&first_codes_tensor, 0)?;
         let first_embed = first_embed.reshape((batch_size, seq_len, 256))?;
 
-        // Debug: print the first code and codebook value
-        #[cfg(debug_assertions)]
-        {
-            eprintln!("DEBUG: first_code[0] = {}", first_codes_mod[0]);
-            let cb_vec: Vec<f32> = self
-                .first_codebook
-                .i((first_codes_mod[0] as usize, ..))?
-                .to_vec1()?;
-            eprintln!(
-                "DEBUG: first_codebook[{},:5] = {:?}",
-                first_codes_mod[0],
-                &cb_vec[..5.min(cb_vec.len())]
-            );
-        }
         // Apply first output projection
         let first_embed_t = first_embed.transpose(1, 2)?; // [batch, 256, seq]
         let first_proj = self.conv1d_1x1(&first_embed_t, &self.first_output_proj)?; // [batch, 512, seq]
@@ -591,22 +569,6 @@ impl Decoder12Hz {
             let layer_codes = codes.i((.., i + 1, ..))?;
             let layer_codes_flat = layer_codes.flatten_all()?;
 
-            // Debug: print first code for first 3 layers
-            #[cfg(debug_assertions)]
-            if i < 3 {
-                let codes_vec: Vec<i64> = layer_codes_flat.to_vec1()?;
-                let first_code = codes_vec[0];
-                let cb_vec: Vec<f32> = self.rest_codebooks[i]
-                    .i((first_code as usize, ..))?
-                    .to_vec1()?;
-                eprintln!(
-                    "DEBUG: rest_code[{}][0] = {}, embed[:5] = {:?}",
-                    i,
-                    first_code,
-                    &cb_vec[..5.min(cb_vec.len())]
-                );
-            }
-
             let embed = self.rest_codebooks[i].index_select(&layer_codes_flat, 0)?;
             let embed = embed.reshape((batch_size, seq_len, 256))?;
             rest_embed = (rest_embed + embed)?;
@@ -615,55 +577,12 @@ impl Decoder12Hz {
         let rest_embed_t = rest_embed.transpose(1, 2)?; // [batch, 256, seq]
         let rest_proj = self.conv1d_1x1(&rest_embed_t, &self.rest_output_proj)?; // [batch, 512, seq]
 
-        // Debug: print first frame quantized values
-        #[cfg(debug_assertions)]
-        {
-            let first_embed_vec: Vec<f32> = first_embed.i((0, 0, ..))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: first_embed[0,:5] = {:?}",
-                &first_embed_vec[..5.min(first_embed_vec.len())]
-            );
-            let first_proj_vec: Vec<f32> = first_proj.i((0, .., 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: first_proj[0,:5,0] = {:?}",
-                &first_proj_vec[..5.min(first_proj_vec.len())]
-            );
-            let rest_embed_vec: Vec<f32> = rest_embed.i((0, 0, ..))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: rest_embed_sum[0,:5] = {:?}",
-                &rest_embed_vec[..5.min(rest_embed_vec.len())]
-            );
-            let rest_proj_vec: Vec<f32> = rest_proj.i((0, .., 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: rest_proj[0,:5,0] = {:?}",
-                &rest_proj_vec[..5.min(rest_proj_vec.len())]
-            );
-        }
-
         // Sum the two projected outputs
         let quantized = (first_proj + rest_proj)?; // [batch, 512, seq]
-
-        #[cfg(debug_assertions)]
-        {
-            let quantized_vec: Vec<f32> = quantized.i((0, .., 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: quantized[0,:5,0] = {:?}",
-                &quantized_vec[..5.min(quantized_vec.len())]
-            );
-        }
 
         // 2. Pre-conv
         // quantized is already [batch, 512, seq] from projections
         let hidden = self.pre_conv.forward(&quantized)?; // [batch, 1024, seq]
-
-        #[cfg(debug_assertions)]
-        {
-            let preconv_vec: Vec<f32> = hidden.i((0, .., 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: pre_conv_out[0,:5,0] = {:?}",
-                &preconv_vec[..5.min(preconv_vec.len())]
-            );
-        }
 
         // 3. Pre-transformer
         let hidden = hidden.transpose(1, 2)?; // [batch, seq, 1024]
@@ -689,124 +608,24 @@ impl Decoder12Hz {
         // 4. Transpose for conv: [batch, seq, 1024] -> [batch, 1024, seq]
         let mut hidden = hidden.transpose(1, 2)?;
 
-        #[cfg(debug_assertions)]
-        {
-            let h_vec: Vec<f32> = hidden.i((0, ..5, 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: after output_proj (transposed)[0,:5,0] = {:?}",
-                h_vec
-            );
-        }
-
         // 5. Upsample stages
-        #[allow(unused_variables, clippy::unused_enumerate_index)]
-        for (i, stage) in self.upsample_stages.iter().enumerate() {
-            // Save trans_conv output for debugging
-            #[cfg(debug_assertions)]
-            if i == 0 {
-                let trans_conv_out = stage.trans_conv.forward(&hidden)?;
-                // Save to file for Python comparison
-                let trans_conv_data: Vec<f32> = trans_conv_out.flatten_all()?.to_vec1()?;
-                let shape = trans_conv_out.dims();
-                eprintln!(
-                    "DEBUG: saving trans_conv output shape {:?}, len {}",
-                    shape,
-                    trans_conv_data.len()
-                );
-                // Save as raw f32 bytes
-                let bytes: Vec<u8> = trans_conv_data
-                    .iter()
-                    .flat_map(|&f| f.to_le_bytes())
-                    .collect();
-                if let Err(e) = std::fs::write("/tmp/rust_trans_conv.bin", &bytes) {
-                    eprintln!("Failed to save trans_conv: {}", e);
-                } else {
-                    eprintln!(
-                        "Saved trans_conv to /tmp/rust_trans_conv.bin ({} bytes)",
-                        bytes.len()
-                    );
-                }
-            }
+        for stage in self.upsample_stages.iter() {
             hidden = stage.forward(&hidden)?;
-            #[cfg(debug_assertions)]
-            {
-                let h_vec: Vec<f32> = hidden.i((0, ..5, 0))?.to_vec1()?;
-                eprintln!(
-                    "DEBUG: after upsample stage {}[0,:5,0] = {:?}, shape={:?}",
-                    i,
-                    h_vec,
-                    hidden.shape()
-                );
-            }
         }
 
         // 6. Decoder.0 (initial conv)
         hidden = self.decoder_init_conv.forward(&hidden)?;
 
-        #[cfg(debug_assertions)]
-        {
-            let h_vec: Vec<f32> = hidden.i((0, ..5, 0))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: after decoder_init_conv[0,:5,0] = {:?}, shape={:?}",
-                h_vec,
-                hidden.shape()
-            );
-
-            // Save decoder_init_conv output for Python comparison
-            let init_conv_data: Vec<f32> = hidden.flatten_all()?.to_vec1()?;
-            let shape = hidden.dims();
-            eprintln!(
-                "DEBUG: saving decoder_init_conv output shape {:?}, len {}",
-                shape,
-                init_conv_data.len()
-            );
-            let bytes: Vec<u8> = init_conv_data
-                .iter()
-                .flat_map(|&f| f.to_le_bytes())
-                .collect();
-            if let Err(e) = std::fs::write("/tmp/rust_decoder_init.bin", &bytes) {
-                eprintln!("Failed to save: {}", e);
-            }
-        }
-
         // 7. Decoder blocks
-        #[allow(unused_variables, clippy::unused_enumerate_index)]
-        for (i, block) in self.decoder_blocks.iter().enumerate() {
+        for block in self.decoder_blocks.iter() {
             hidden = block.forward(&hidden)?;
-            #[cfg(debug_assertions)]
-            {
-                let h_vec: Vec<f32> = hidden.i((0, ..5, 0))?.to_vec1()?;
-                eprintln!(
-                    "DEBUG: after decoder_block {}[0,:5,0] = {:?}, shape={:?}",
-                    i,
-                    h_vec,
-                    hidden.shape()
-                );
-            }
         }
 
         // 8. Final SnakeBeta
         hidden = self.final_snake.forward(&hidden)?;
 
-        #[cfg(debug_assertions)]
-        {
-            let h_vec: Vec<f32> = hidden.i((0, ..5, 0))?.to_vec1()?;
-            eprintln!("DEBUG: after final_snake[0,:5,0] = {:?}", h_vec);
-        }
-
         // 9. Final conv
         hidden = self.final_conv.forward(&hidden)?;
-
-        #[cfg(debug_assertions)]
-        {
-            // After final conv, shape is [batch, 1, samples], so index differently
-            let h_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!(
-                "DEBUG: after final_conv (before clamp)[0,0,:5] = {:?}, shape={:?}",
-                h_vec,
-                hidden.shape()
-            );
-        }
 
         // 10. Clamp to [-1, 1] per official implementation
         // The decoder outputs values in a large range (e.g., [-27, 27])
@@ -846,12 +665,6 @@ impl Decoder12Hz {
     fn run_transformer(&self, mut hidden: Tensor, seq_len: usize) -> Result<Tensor> {
         let device = hidden.device();
         let (batch_size, _, _) = hidden.dims3()?;
-
-        #[cfg(debug_assertions)]
-        {
-            let h_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG TRANSFORMER: input[0,0,:5] = {:?}", h_vec);
-        }
 
         // Build RoPE embeddings
         let positions = Tensor::arange(0u32, seq_len as u32, device)?;
@@ -894,12 +707,6 @@ impl Decoder12Hz {
             )?;
         }
 
-        #[cfg(debug_assertions)]
-        {
-            let h_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG TRANSFORMER: output[0,0,:5] = {:?}", h_vec);
-        }
-
         Ok(hidden)
     }
 
@@ -923,12 +730,6 @@ impl Decoder12Hz {
         let q = self.linear_3d(&normed, &layer.q_proj_weight, None)?;
         let k = self.linear_3d(&normed, &layer.k_proj_weight, None)?;
         let v = self.linear_3d(&normed, &layer.v_proj_weight, None)?;
-
-        #[cfg(debug_assertions)]
-        if layer_idx == 0 {
-            let q_vec: Vec<f32> = q.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG LAYER 0: q[0,0,:5] = {:?}", q_vec);
-        }
 
         // Reshape for multi-head attention
         let q = q
@@ -960,12 +761,6 @@ impl Decoder12Hz {
         let q = self.apply_rope(&q, cos, sin)?;
         let k = self.apply_rope(&k, cos, sin)?;
 
-        #[cfg(debug_assertions)]
-        if layer_idx == 0 {
-            let q_vec: Vec<f32> = q.i((0, 0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG LAYER 0: q after rope [0,0,0,:5] = {:?}", q_vec);
-        }
-
         // Attention
         let scale = (self.config.head_dim as f64).powf(-0.5);
         let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
@@ -988,12 +783,6 @@ impl Decoder12Hz {
         let attn_out = attn_out.broadcast_mul(&layer.attn_layer_scale)?;
         let hidden = (hidden + attn_out)?;
 
-        #[cfg(debug_assertions)]
-        if layer_idx == 0 {
-            let h_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG LAYER 0: after attn[0,0,:5] = {:?}", h_vec);
-        }
-
         // MLP
         let normed = self.rms_norm(&hidden, &layer.post_ln_weight)?;
         let gate = self.linear_3d(&normed, &layer.gate_proj_weight, None)?;
@@ -1004,12 +793,6 @@ impl Decoder12Hz {
         // Layer scale and residual
         let mlp_out = mlp_out.broadcast_mul(&layer.mlp_layer_scale)?;
         let hidden = (hidden + mlp_out)?;
-
-        #[cfg(debug_assertions)]
-        if layer_idx == 0 {
-            let h_vec: Vec<f32> = hidden.i((0, 0, ..5))?.to_vec1()?;
-            eprintln!("DEBUG LAYER 0: after mlp[0,0,:5] = {:?}", h_vec);
-        }
 
         Ok(hidden)
     }

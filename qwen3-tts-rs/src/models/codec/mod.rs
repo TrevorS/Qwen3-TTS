@@ -13,6 +13,7 @@ pub mod convnext_block;
 pub mod decoder;
 pub mod decoder_12hz;
 pub mod decoder_block;
+pub mod encoder_12hz;
 mod quantizer;
 pub mod snake_beta;
 
@@ -22,6 +23,7 @@ pub use convnext_block::ConvNeXtBlock;
 pub use decoder::{CodecDecoder, DecoderConfig};
 pub use decoder_12hz::{Decoder12Hz, Decoder12HzConfig};
 pub use decoder_block::{DecoderBlock, ResidualUnit};
+pub use encoder_12hz::Encoder12Hz;
 pub use quantizer::{ResidualVectorQuantizer, VectorQuantizer};
 pub use snake_beta::SnakeBeta;
 

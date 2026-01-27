@@ -62,6 +62,32 @@ impl Default for CodePredictorConfig {
 }
 
 impl CodePredictorConfig {
+    /// Create config from parsed HuggingFace config.json.
+    ///
+    /// When the talker hidden_size differs from the code predictor hidden_size
+    /// (e.g. 1.7B models: talker=2048, CP=1024), `codec_embed_dim` is set to
+    /// the talker's hidden_size so the `small_to_mtp_projection` layer is created.
+    pub fn from_parsed(parsed: &super::config::ParsedModelConfig) -> Self {
+        let codec_embed_dim = if parsed.talker_hidden_size != parsed.cp_hidden_size {
+            Some(parsed.talker_hidden_size)
+        } else {
+            None
+        };
+        Self {
+            hidden_size: parsed.cp_hidden_size,
+            intermediate_size: parsed.cp_intermediate_size,
+            num_hidden_layers: parsed.cp_num_hidden_layers,
+            num_attention_heads: parsed.cp_num_attention_heads,
+            num_key_value_heads: parsed.cp_num_key_value_heads,
+            head_dim: parsed.cp_head_dim,
+            rms_norm_eps: parsed.cp_rms_norm_eps,
+            rope_theta: parsed.cp_rope_theta,
+            vocab_size: parsed.cp_vocab_size,
+            num_code_groups: parsed.cp_num_code_groups,
+            codec_embed_dim,
+        }
+    }
+
     /// Create config from Qwen3TTS config
     pub fn from_qwen3_tts(config: &Qwen3TTSConfig) -> Self {
         Self {
@@ -385,6 +411,28 @@ impl CodePredictor {
         let code_tensor = Tensor::new(&[code], device)?;
         let embed = self.codec_embeddings[group_idx].forward(&code_tensor)?;
         Ok(embed.unsqueeze(0)?) // [1, 1, codec_embed_dim]
+    }
+
+    /// Embed a sequence of codes for a specific acoustic group.
+    ///
+    /// Used by ICL voice cloning to build reference codec embeddings.
+    ///
+    /// # Arguments
+    /// * `group_idx` — acoustic group (0–14 for codebook groups 2–16)
+    /// * `codes` — 1-D i64 tensor of codec token IDs, shape `[T]`
+    ///
+    /// # Returns
+    /// Tensor of shape `[1, T, codec_embed_dim]`
+    pub fn embed_codes_for_group(&self, group_idx: usize, codes: &Tensor) -> Result<Tensor> {
+        if group_idx >= self.codec_embeddings.len() {
+            anyhow::bail!(
+                "Invalid group_idx {} (max {})",
+                group_idx,
+                self.codec_embeddings.len() - 1
+            );
+        }
+        let embed = self.codec_embeddings[group_idx].forward(codes)?; // [T, codec_embed_dim]
+        Ok(embed.unsqueeze(0)?) // [1, T, codec_embed_dim]
     }
 
     /// Get sum of all acoustic code embeddings

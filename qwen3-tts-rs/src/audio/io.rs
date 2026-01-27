@@ -43,12 +43,7 @@ impl AudioBuffer {
 
     /// Create from a Candle tensor (assumed shape: `[samples]` or `[1, samples]`)
     pub fn from_tensor(tensor: Tensor, sample_rate: u32) -> Result<Self> {
-        let tensor = if tensor.dims().len() == 2 {
-            tensor.squeeze(0)?
-        } else {
-            tensor
-        };
-
+        let tensor = tensor.flatten_all()?;
         let samples: Vec<f32> = tensor.to_vec1()?;
         Ok(Self::new(samples, sample_rate))
     }

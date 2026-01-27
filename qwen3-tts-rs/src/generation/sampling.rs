@@ -65,12 +65,14 @@ pub struct GenerationConfig {
     pub temperature: f64,
     /// Top-k sampling (0 = disabled)
     pub top_k: usize,
-    /// Top-p (nucleus) sampling threshold
+    /// Top-p (nucleus) sampling threshold (1.0 = disabled)
     pub top_p: f64,
     /// Repetition penalty (1.0 = no penalty)
     pub repetition_penalty: f64,
     /// End-of-sequence token ID (generation stops when this token is sampled)
     pub eos_token_id: Option<u32>,
+    /// Minimum number of tokens before EOS is allowed (default: 2, matching Python)
+    pub min_new_tokens: usize,
 }
 
 impl Default for GenerationConfig {
@@ -82,6 +84,7 @@ impl Default for GenerationConfig {
             top_p: 0.9,
             repetition_penalty: 1.0,
             eos_token_id: None,
+            min_new_tokens: 2,
         }
     }
 }
@@ -111,31 +114,17 @@ pub fn sample(logits: &Tensor, config: &GenerationConfig) -> Result<Tensor> {
 
     // Apply top-k filtering
     let logits = if config.top_k > 0 {
-        #[cfg(debug_assertions)]
-        eprintln!("DEBUG SAMPLE: applying top_k={}", config.top_k);
         top_k_filter(&logits, config.top_k)?
     } else {
         logits
     };
 
-    // Debug: check filtered logits
-    #[cfg(debug_assertions)]
-    {
-        let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-        let non_neg_inf: Vec<(usize, f32)> = logits_vec
-            .iter()
-            .enumerate()
-            .filter(|(_, &v)| v != f32::NEG_INFINITY)
-            .map(|(i, &v)| (i, v))
-            .collect();
-        eprintln!(
-            "DEBUG SAMPLE: after top-k, {} non-inf values, max at {:?}",
-            non_neg_inf.len(),
-            non_neg_inf
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        );
-    }
+    // Apply top-p (nucleus) filtering
+    let logits = if config.top_p < 1.0 && config.top_p > 0.0 {
+        top_p_filter(&logits, config.top_p)?
+    } else {
+        logits
+    };
 
     // Convert to probabilities
     let probs = candle_nn::ops::softmax_last_dim(&logits)?;
@@ -164,6 +153,48 @@ fn top_k_filter(logits: &Tensor, k: usize) -> Result<Tensor> {
             .iter()
             .map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY })
             .collect();
+        result_data.extend(filtered);
+    }
+
+    Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
+}
+
+/// Apply top-p (nucleus) filtering: keep smallest set of tokens whose cumulative probability >= top_p
+fn top_p_filter(logits: &Tensor, p: f64) -> Result<Tensor> {
+    let (batch, vocab) = logits.dims2()?;
+    let mut result_data = Vec::with_capacity(batch * vocab);
+
+    for b in 0..batch {
+        let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+
+        // Sort indices by logit value descending
+        let mut indices: Vec<usize> = (0..vocab).collect();
+        indices.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+
+        // Compute softmax over sorted logits
+        let max_val = row[indices[0]];
+        let mut exp_sorted: Vec<f32> = indices.iter().map(|&i| (row[i] - max_val).exp()).collect();
+        let sum: f32 = exp_sorted.iter().sum();
+        for v in &mut exp_sorted {
+            *v /= sum;
+        }
+
+        // Find cutoff: cumulative probability exceeds top_p
+        let mut cumsum = 0.0f32;
+        let mut cutoff_idx = vocab; // keep all by default
+        for (i, &prob) in exp_sorted.iter().enumerate() {
+            cumsum += prob;
+            if cumsum > p as f32 {
+                cutoff_idx = i + 1; // include the token that pushes us over
+                break;
+            }
+        }
+
+        // Mask tokens beyond the cutoff
+        let mut filtered = vec![f32::NEG_INFINITY; vocab];
+        for &idx in &indices[..cutoff_idx] {
+            filtered[idx] = row[idx];
+        }
         result_data.extend(filtered);
     }
 
@@ -318,6 +349,7 @@ mod tests {
         assert!((config.top_p - 0.9).abs() < 1e-6);
         assert!((config.repetition_penalty - 1.0).abs() < 1e-6);
         assert_eq!(config.eos_token_id, None);
+        assert_eq!(config.min_new_tokens, 2);
     }
 
     #[test]
@@ -328,12 +360,13 @@ mod tests {
             top_k: 10,
             top_p: 0.8,
             repetition_penalty: 1.2,
-            eos_token_id: Some(151670),
+            eos_token_id: Some(42),
+            min_new_tokens: 0,
         };
         assert_eq!(config.max_new_tokens, 512);
         assert!((config.temperature - 0.5).abs() < 1e-6);
         assert_eq!(config.top_k, 10);
-        assert_eq!(config.eos_token_id, Some(151670));
+        assert_eq!(config.eos_token_id, Some(42));
     }
 
     #[test]

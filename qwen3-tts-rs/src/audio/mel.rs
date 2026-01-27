@@ -52,6 +52,22 @@ pub struct MelSpectrogram {
 }
 
 impl MelSpectrogram {
+    /// Configuration tuned for the ECAPA-TDNN speaker encoder.
+    ///
+    /// Uses n_fft=1024, hop=256, win=1024 to match the Python reference
+    /// `Qwen3TTSSpeakerEncoderConfig`.
+    pub fn speaker_encoder() -> MelConfig {
+        MelConfig {
+            sample_rate: 24000,
+            n_fft: 1024,
+            hop_length: 256,
+            win_length: Some(1024),
+            n_mels: 128,
+            fmin: 0.0,
+            fmax: None,
+        }
+    }
+
     /// Create a new mel spectrogram extractor
     pub fn new(config: MelConfig) -> Self {
         let win_length = config.win_length.unwrap_or(config.n_fft);
@@ -114,17 +130,81 @@ impl MelSpectrogram {
             .collect()
     }
 
+    /// Compute mel spectrogram for the speaker encoder.
+    ///
+    /// Differs from [`compute`] in two ways:
+    /// - Uses **magnitude** spectrum (`sqrt(re² + im² + 1e-9)`) rather than power spectrum
+    /// - Applies `log(clamp(mel, 1e-5))` compression
+    ///
+    /// Returns a tensor of shape `[n_mels, n_frames]`.
+    pub fn compute_for_speaker_encoder(
+        &self,
+        samples: &[f32],
+        device: &Device,
+    ) -> anyhow::Result<Tensor> {
+        let stft = self.stft(samples);
+
+        // Magnitude spectrum (not power)
+        let mag_spec: Vec<Vec<f32>> = stft
+            .iter()
+            .map(|frame| {
+                frame
+                    .iter()
+                    .map(|c| (c.re * c.re + c.im * c.im + 1e-9).sqrt())
+                    .collect()
+            })
+            .collect();
+
+        // Apply mel filterbank
+        let mel = self.apply_mel_filterbank(&mag_spec);
+
+        // Log compression with floor
+        let log_mel: Vec<Vec<f32>> = mel
+            .into_iter()
+            .map(|frame| frame.into_iter().map(|v| v.max(1e-5).ln()).collect())
+            .collect();
+
+        let n_frames = log_mel.len();
+        let n_mels = self.config.n_mels;
+
+        let flat: Vec<f32> = log_mel.into_iter().flatten().collect();
+        let tensor = Tensor::new(flat.as_slice(), device)?
+            .reshape((n_frames, n_mels))?
+            .transpose(0, 1)?; // [n_mels, n_frames]
+
+        Ok(tensor)
+    }
+
     /// Short-time Fourier transform
     fn stft(&self, samples: &[f32]) -> Vec<Vec<Complex<f32>>> {
         let n_fft = self.config.n_fft;
         let hop_length = self.config.hop_length;
         let win_length = self.window.len();
 
-        // Pad signal
-        let pad_length = n_fft / 2;
-        let mut padded = vec![0.0f32; pad_length];
+        // Reflect-pad signal to match PyTorch's torch.stft with center=False
+        // after manual reflect padding: pad = (n_fft - hop_length) / 2
+        let pad_length = (n_fft - hop_length) / 2;
+        let mut padded = Vec::with_capacity(pad_length + samples.len() + pad_length);
+
+        // Left reflect padding: mirror from position 1 outward
+        for i in (1..=pad_length).rev() {
+            let idx = if i < samples.len() {
+                i
+            } else {
+                samples.len() - 1
+            };
+            padded.push(samples[idx]);
+        }
         padded.extend_from_slice(samples);
-        padded.extend(vec![0.0f32; pad_length]);
+        // Right reflect padding: mirror from position len-2 inward
+        for i in 0..pad_length {
+            let idx = if samples.len() >= 2 + i {
+                samples.len() - 2 - i
+            } else {
+                0
+            };
+            padded.push(samples[idx]);
+        }
 
         // Setup FFT
         let mut planner = FftPlanner::new();
@@ -178,7 +258,42 @@ impl MelSpectrogram {
             .collect()
     }
 
-    /// Create mel filterbank matrix
+    /// Convert frequency in Hz to mel scale (Slaney / O'Shaughnessy).
+    ///
+    /// This is the librosa default (`htk=False`): linear below 1000 Hz,
+    /// logarithmic above.
+    fn hz_to_mel(f: f32) -> f32 {
+        const F_SP: f32 = 200.0 / 3.0; // 66.667 Hz per mel below break
+        const MIN_LOG_HZ: f32 = 1000.0;
+        const MIN_LOG_MEL: f32 = MIN_LOG_HZ / F_SP; // 15.0
+        const LOGSTEP: f32 = 0.068_751_74; // ln(6.4) / 27
+
+        if f < MIN_LOG_HZ {
+            f / F_SP
+        } else {
+            MIN_LOG_MEL + (f / MIN_LOG_HZ).ln() / LOGSTEP
+        }
+    }
+
+    /// Convert mel value to Hz (Slaney / O'Shaughnessy).
+    fn mel_to_hz(m: f32) -> f32 {
+        const F_SP: f32 = 200.0 / 3.0;
+        const MIN_LOG_HZ: f32 = 1000.0;
+        const MIN_LOG_MEL: f32 = MIN_LOG_HZ / F_SP;
+        const LOGSTEP: f32 = 0.068_751_74; // ln(6.4) / 27
+
+        if m < MIN_LOG_MEL {
+            m * F_SP
+        } else {
+            MIN_LOG_HZ * ((m - MIN_LOG_MEL) * LOGSTEP).exp()
+        }
+    }
+
+    /// Create mel filterbank matrix (matches `librosa.filters.mel` defaults).
+    ///
+    /// Uses the Slaney mel scale with Slaney area-normalization, matching
+    /// `librosa.filters.mel(sr=..., n_fft=..., n_mels=..., fmin=..., fmax=..., norm="slaney")`
+    /// which is the default in librosa ≥ 0.10.
     fn create_mel_filterbank(
         sample_rate: u32,
         n_fft: usize,
@@ -188,52 +303,44 @@ impl MelSpectrogram {
     ) -> Vec<Vec<f32>> {
         let n_freqs = n_fft / 2 + 1;
 
-        // Mel scale conversion functions
-        let hz_to_mel = |f: f32| 2595.0 * (1.0 + f / 700.0).log10();
-        let mel_to_hz = |m: f32| 700.0 * (10.0f32.powf(m / 2595.0) - 1.0);
-
-        // Create mel points
-        let mel_min = hz_to_mel(fmin);
-        let mel_max = hz_to_mel(fmax);
+        // Create linearly spaced mel points
+        let mel_min = Self::hz_to_mel(fmin);
+        let mel_max = Self::hz_to_mel(fmax);
         let mel_points: Vec<f32> = (0..=n_mels + 1)
             .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
             .collect();
 
         // Convert to Hz
-        let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
+        let hz_points: Vec<f32> = mel_points.iter().map(|&m| Self::mel_to_hz(m)).collect();
 
-        // Convert to FFT bin indices
-        let bin_points: Vec<usize> = hz_points
-            .iter()
-            .map(|&f| ((n_fft + 1) as f32 * f / sample_rate as f32).floor() as usize)
+        // FFT bin center frequencies
+        let fft_freqs: Vec<f32> = (0..n_freqs)
+            .map(|i| i as f32 * sample_rate as f32 / n_fft as f32)
             .collect();
 
-        // Create filterbank
+        // Build triangular filterbank (librosa ramps approach)
         let mut filterbank = vec![vec![0.0f32; n_freqs]; n_mels];
 
         for i in 0..n_mels {
-            let left = bin_points[i];
-            let center = bin_points[i + 1];
-            let right = bin_points[i + 2];
+            let f_lower = hz_points[i];
+            let f_center = hz_points[i + 1];
+            let f_upper = hz_points[i + 2];
 
-            // Rising slope
-            let rising_denom = (center - left).max(1) as f32;
-            for (j, val) in filterbank[i].iter_mut().enumerate().take(center).skip(left) {
-                if j < n_freqs {
-                    *val = (j - left) as f32 / rising_denom;
+            for (j, &freq) in fft_freqs.iter().enumerate() {
+                if freq >= f_lower && freq <= f_center && f_center > f_lower {
+                    filterbank[i][j] = (freq - f_lower) / (f_center - f_lower);
+                } else if freq > f_center && freq <= f_upper && f_upper > f_center {
+                    filterbank[i][j] = (f_upper - freq) / (f_upper - f_center);
                 }
             }
 
-            // Falling slope
-            let falling_denom = (right - center).max(1) as f32;
-            for (j, val) in filterbank[i]
-                .iter_mut()
-                .enumerate()
-                .take(right)
-                .skip(center)
-            {
-                if j < n_freqs {
-                    *val = (right - j) as f32 / falling_denom;
+            // Slaney area-normalization: scale each filter so energy is
+            // approximately constant per channel
+            let band_width = hz_points[i + 2] - hz_points[i];
+            if band_width > 0.0 {
+                let enorm = 2.0 / band_width;
+                for val in &mut filterbank[i] {
+                    *val *= enorm;
                 }
             }
         }
