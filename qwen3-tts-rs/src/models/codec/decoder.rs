@@ -177,7 +177,10 @@ impl DecoderAttention {
             .transpose(1, 2)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?;
 

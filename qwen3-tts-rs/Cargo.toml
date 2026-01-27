@@ -17,9 +17,9 @@ hub = ["hf-hub"]
 
 [dependencies]
 # Candle ML framework
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
 
 # Tokenization (HuggingFace tokenizers in Rust)
 tokenizers = "0.21"

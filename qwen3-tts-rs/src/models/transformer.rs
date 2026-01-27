@@ -339,7 +339,12 @@ impl Attention {
         let v = self.repeat_kv(&v)?;
 
         // Scaled dot-product attention
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * self.scale)?;
+        // Ensure contiguous layout for CUDA matmul (transpose creates non-contiguous views)
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let attn_weights =
+            (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * self.scale)?;
 
         let attn_weights = if let Some(mask) = attention_mask {
             attn_weights.broadcast_add(mask)?

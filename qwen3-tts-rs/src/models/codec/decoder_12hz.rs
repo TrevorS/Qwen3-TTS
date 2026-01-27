@@ -763,7 +763,10 @@ impl Decoder12Hz {
 
         // Attention
         let scale = (self.config.head_dim as f64).powf(-0.5);
-        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
         let attn = (attn * scale)?;
         let attn = attn.broadcast_add(causal_mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;

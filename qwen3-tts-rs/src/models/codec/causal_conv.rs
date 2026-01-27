@@ -39,6 +39,7 @@ impl CausalConv1d {
             stride: 1,
             dilation,
             groups: 1,
+            ..Default::default()
         };
 
         let conv = conv1d(in_channels, out_channels, kernel_size, config, vb)?;
@@ -75,6 +76,7 @@ impl CausalConv1d {
             stride: 1,
             dilation,
             groups,
+            ..Default::default()
         };
 
         let conv = Conv1d::new(weight, bias, config);
