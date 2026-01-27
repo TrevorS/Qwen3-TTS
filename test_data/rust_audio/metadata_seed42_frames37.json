@@ -1,0 +1,25 @@
+{
+  "text": "Hello world, this is a test.",
+  "seed": 42,
+  "num_frames": 37,
+  "temperature": 0.7,
+  "top_k": 50,
+  "top_p": 0.9,
+  "input_ids": [
+    9707,
+    1879,
+    11,
+    419,
+    374,
+    264,
+    1273,
+    13
+  ],
+  "codes_shape": [
+    1,
+    16,
+    37
+  ],
+  "audio_samples": 69120,
+  "sample_rate": 24000
+}

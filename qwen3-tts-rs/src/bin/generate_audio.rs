@@ -19,7 +19,10 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use models::talker::{Language, Speaker, TalkerConfig};
-use qwen3_tts::{generation, models, tokenizer, AudioBuffer, ModelType, ParsedModelConfig};
+use qwen3_tts::{
+    generation, models, tokenizer, AudioBuffer, ModelType, ParsedModelConfig, Qwen3TTS,
+    SynthesisOptions,
+};
 
 /// Generate reference audio with deterministic seed for comparison
 #[derive(Parser, Debug)]
@@ -100,6 +103,10 @@ struct Args {
     /// Repetition penalty (1.0 = disabled, 1.05 = Python default)
     #[arg(long, default_value_t = 1.05)]
     repetition_penalty: f64,
+
+    /// Output WAV file path (overrides default naming in --output-dir)
+    #[arg(long)]
+    output: Option<String>,
 }
 
 fn parse_speaker(name: &str) -> Result<Speaker> {
@@ -148,11 +155,140 @@ struct GenerationMetadata {
     sample_rate: u32,
 }
 
+/// Validate CLI arg combinations and bail early on contradictory flags.
+fn validate_args(args: &Args) -> Result<()> {
+    // --ref-text requires --ref-audio (ref text is an ICL transcript for voice cloning)
+    if args.ref_text.is_some() && args.ref_audio.is_none() {
+        anyhow::bail!("--ref-text requires --ref-audio (reference text is the transcript of the reference audio for ICL voice cloning)");
+    }
+
+    // --x-vector-only requires --ref-audio (it's a voice cloning mode)
+    if args.x_vector_only && args.ref_audio.is_none() {
+        anyhow::bail!(
+            "--x-vector-only requires --ref-audio (x_vector_only is a voice cloning mode)"
+        );
+    }
+
+    // --x-vector-only + --ref-text is contradictory: x_vector_only disables ICL
+    if args.x_vector_only && args.ref_text.is_some() {
+        anyhow::bail!(
+            "--x-vector-only and --ref-text are mutually exclusive.\n  \
+             x_vector_only uses only the speaker embedding (no ICL).\n  \
+             Remove --x-vector-only to use ICL mode with reference text."
+        );
+    }
+
+    // --custom-voice + --ref-audio: CustomVoice models don't have a speaker encoder
+    if args.custom_voice && args.ref_audio.is_some() {
+        anyhow::bail!(
+            "--custom-voice and --ref-audio are incompatible.\n  \
+             CustomVoice models use preset speakers (--speaker), not voice cloning.\n  \
+             Use a Base model for voice cloning with reference audio."
+        );
+    }
+
+    // --compare only works in the preset speaker path (low-level generation)
+    if args.compare && args.ref_audio.is_some() {
+        anyhow::bail!(
+            "--compare is only supported in the preset speaker code path.\n  \
+             Voice cloning uses the high-level API which doesn't emit comparison data."
+        );
+    }
+
+    Ok(())
+}
+
+/// Voice cloning path: uses the high-level Qwen3TTS API when --ref-audio is provided.
+fn run_voice_clone(args: &Args) -> Result<()> {
+    let ref_audio_path = args.ref_audio.as_ref().expect("--ref-audio required");
+
+    println!("=== Voice Clone Generation ===");
+    println!("Text: {}", args.text);
+    println!("Reference audio: {}", ref_audio_path);
+    if let Some(ref rt) = args.ref_text {
+        println!("Reference text (ICL): {}", rt);
+    } else {
+        println!("Mode: x_vector_only (no reference text)");
+    }
+
+    // Set seed
+    generation::set_seed(args.seed);
+    generation::reset_rng();
+    println!("Seed: {}", args.seed);
+
+    let device = Device::Cpu;
+    let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
+
+    // Load reference audio
+    let ref_audio = AudioBuffer::load(ref_audio_path)?;
+    println!(
+        "Loaded reference audio: {:.2}s, {} samples",
+        ref_audio.duration(),
+        ref_audio.len()
+    );
+
+    // Create voice clone prompt (x_vector_only or ICL depending on --ref-text)
+    let prompt = model.create_voice_clone_prompt(&ref_audio, args.ref_text.as_deref())?;
+
+    let language = parse_language(&args.language)?;
+
+    // Calculate max frames from duration if specified
+    let max_frames = if let Some(duration) = args.duration {
+        (duration * 12.5) as usize
+    } else {
+        args.frames
+    };
+
+    let options = SynthesisOptions {
+        max_length: max_frames,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        repetition_penalty: args.repetition_penalty,
+        ..Default::default()
+    };
+
+    println!("Generating up to {} frames...", max_frames);
+    let audio = model.synthesize_voice_clone(&args.text, &prompt, language, Some(options))?;
+    println!(
+        "Generated: {:.2}s, {} samples",
+        audio.duration(),
+        audio.len()
+    );
+
+    // Determine output path
+    let output_path = if let Some(ref out) = args.output {
+        std::path::PathBuf::from(out)
+    } else {
+        let output_dir = Path::new(&args.output_dir);
+        fs::create_dir_all(output_dir)?;
+        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, max_frames))
+    };
+
+    // Ensure parent directory exists
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    audio.save(&output_path)?;
+    println!("Saved WAV to: {}", output_path.display());
+
+    generation::clear_seed();
+    println!("Generation complete!");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    validate_args(&args)?;
+
+    // Voice clone path: when --ref-audio is provided, use the high-level API
+    if args.ref_audio.is_some() {
+        return run_voice_clone(&args);
+    }
 
     // Calculate frames from duration if specified
     let num_frames = if let Some(duration) = args.duration {
@@ -341,7 +477,11 @@ fn main() -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
-        eos_token_id: None, // Don't stop early for comparison
+        eos_token_id: if args.compare {
+            None // Don't stop early when comparing with Python reference
+        } else {
+            Some(qwen3_tts::CODEC_EOS_TOKEN_ID)
+        },
         min_new_tokens: 2,
     };
 
@@ -384,6 +524,14 @@ fn main() -> Result<()> {
 
     // Generation loop: for each frame, generate acoustic codes, then prepare next step
     for frame_idx in 0..num_frames {
+        // Check EOS before processing this frame
+        if let Some(eos_id) = gen_config.eos_token_id {
+            if semantic_token == eos_id {
+                println!("EOS token {} at frame {} — stopping generation", eos_id, frame_idx);
+                break;
+            }
+        }
+
         // Get semantic token embedding
         let semantic_embed = talker.get_codec_embedding(semantic_token)?;
 
@@ -471,7 +619,15 @@ fn main() -> Result<()> {
     );
 
     // Save audio as WAV
-    let wav_path = output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, num_frames));
+    let wav_path = if let Some(ref out) = args.output {
+        let p = std::path::PathBuf::from(out);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        p
+    } else {
+        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, num_frames))
+    };
     let audio_buffer = AudioBuffer::new(audio_samples.clone(), 24000);
     audio_buffer.save(&wav_path)?;
     println!("Saved WAV to: {:?}", wav_path);

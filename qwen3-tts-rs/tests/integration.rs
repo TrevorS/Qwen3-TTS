@@ -255,7 +255,7 @@ mod end_to_end_mock {
 
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.8).abs() < 1e-6);
-        assert_eq!(options.eos_token_id, Some(151670));
+        assert_eq!(options.eos_token_id, Some(qwen3_tts::CODEC_EOS_TOKEN_ID));
     }
 
     #[test]
