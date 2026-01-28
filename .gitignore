@@ -26,4 +26,8 @@ env/
 # Generated test artifacts
 test_data/variant_tests/python-*.wav
 test_data/variant_tests/rust-*-verify.wav
+test_data/variant_tests/cuda/
+test_data/variant_tests/cpu/
+test_data/variant_tests/index.html
+test_data/variant_tests/results.json
 test_data/icl_fixes/

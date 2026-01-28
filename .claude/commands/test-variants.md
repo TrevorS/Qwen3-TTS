@@ -128,9 +128,20 @@ ICL transcript: `"That's one small step for man, one giant leap for mankind."`
   --output test_data/variant_tests/1.7b-customvoice-serena.wav
 ```
 
-### VoiceDesign models (text-prompted voice — not yet supported)
+### VoiceDesign models (text-described voice via `--instruct`)
 
-VoiceDesign uses natural language descriptions to design voices (`tts_model_type: voice_design`, empty `spk_id` map). The CLI doesn't support this yet. The script auto-detects VoiceDesign from `config.json` and skips it.
+VoiceDesign uses natural language descriptions to condition the voice (`tts_model_type: voice_design`, empty `spk_id` map). Use `--instruct` with a voice description.
+
+**9. 1.7B VoiceDesign, instruct:**
+```bash
+./qwen3-tts-rs/target/release/generate_audio \
+  --model-dir test_data/models/1.7b-voicedesign \
+  --instruct "A cheerful young female voice with clear pronunciation and natural intonation." \
+  --text "Hello world, this is a test." \
+  --language english \
+  --duration 3.0 --seed 42 \
+  --output test_data/variant_tests/1.7b-voicedesign-instruct.wav
+```
 
 ### Adding `--device cuda` for GPU tests
 
